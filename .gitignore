@@ -1,0 +1,29 @@
+# --- Secrets & environment ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- LACE runtime artifacts (large / per-run / regenerable) ---
+artifacts/
+memory/memory.db
+memory/memory.db-*
+.langgraph_api/
+.sisyphus/
+
+# --- Debug scratch logs (writers.py emits these when debug logging on) ---
+/tmp/lace_*.log
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store

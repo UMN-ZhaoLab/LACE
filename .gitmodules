@@ -1,0 +1,15 @@
+[submodule "tools/riscv-formal"]
+	path = tools/riscv-formal
+	url = git@github.com:Nick-Zheng-Q/riscv-formal.git
+[submodule "cpu_prototype/e203_hbirdv2"]
+	path = cpu_prototype/e203_hbirdv2
+	url = git@github.com:cherry-bunny779/e203_hbirdv2.git
+[submodule "cpu_prototype/ibex"]
+	path = cpu_prototype/ibex
+	url = https://github.com/Nick-Zheng-Q/ibex.git
+[submodule "cpu_prototype/picorv32"]
+	path = cpu_prototype/picorv32
+	url = https://github.com/YosysHQ/picorv32.git
+[submodule "cpu_prototype/cv32e40x"]
+	path = cpu_prototype/cv32e40x
+	url = https://github.com/Nick-Zheng-Q/cv32e40x.git
