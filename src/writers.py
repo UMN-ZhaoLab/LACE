@@ -7,6 +7,7 @@ generated code back to the workspace.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -26,6 +27,8 @@ from src.llm import get_chat_model, get_structured_runnable
 from src.nodes.agent_runner import invoke_with_backoff
 from src.config import LACEConfig
 from src.state_types import ArithmeticExprsOut, WorkflowState, ensure_state
+
+logger = logging.getLogger("lace.writer")
 
 
 def _coerce_model_content(content: Any) -> str:
@@ -202,12 +205,7 @@ def interface_writer(state: WorkflowState | dict[str, Any]) -> WorkflowState:
     response = _safe_invoke(messages)
     content = _coerce_model_content(response.content)
 
-    # Debug: log LLM raw response
-    debug_path = Path(f"/tmp/lace_llm_response_{state.hdl_index}.log")
-    with open(debug_path, "a", encoding="utf-8") as f:
-        f.write(f"=== hdl_index={state.hdl_index} ===\n")
-        f.write(content)
-        f.write("\n\n")
+    logger.debug("interface_writer hdl_index=%s response_len=%d", state.hdl_index, len(content))
 
     return merge_interface_result(state, content)
 
@@ -251,11 +249,7 @@ def arithmetic_writer(state: WorkflowState | dict[str, Any]) -> WorkflowState:
     response = model.invoke(messages)
     content = _coerce_model_content(response.content)
 
-    # Debug: log generated arithmetic code
-    debug_path = Path("/tmp/lace_arithmetic_debug.log")
-    with open(debug_path, "a", encoding="utf-8") as f:
-        f.write("=== arithmetic ===\n")
-        f.write(f"generated_code:\n{content}\n\n")
+    logger.debug("arithmetic_writer response_len=%d", len(content))
 
     return merge_arithmetic_result(state, content)
 
@@ -281,12 +275,7 @@ def insn_model_writer(state: WorkflowState | dict[str, Any]) -> WorkflowState:
     response = model.invoke(messages)
     content = _coerce_model_content(response.content)
 
-    # Debug: log generated insn model
-    debug_path = Path("/tmp/lace_insn_model_debug.log")
-    with open(debug_path, "a", encoding="utf-8") as f:
-        f.write("=== insn_model ===\n")
-        f.write(f"spec: {state.spec[:200]}\n")
-        f.write(f"generated_code:\n{content}\n\n")
+    logger.debug("insn_model_writer spec_len=%d response_len=%d", len(state.spec), len(content))
 
     riscv_formal_dir = Path(LACEConfig.RISCV_FORMAL_DIR)
     if not riscv_formal_dir.is_absolute():
