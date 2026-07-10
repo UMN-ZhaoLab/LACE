@@ -104,9 +104,12 @@ class TestChecks(unittest.TestCase):
         self.assertTrue(result.arithmetic_syntax_ok)
 
     def test_function_check_needs_review(self) -> None:
+        # When needs_review is already set, function_check must NOT force
+        # function_ok=True (that would mask an unresolved failure). It should
+        # preserve the existing value and clear advance_op.
         state = self._make_state(needs_review=True, interface_syntax_ok=True)
         result = function_check(state)
-        self.assertTrue(result.function_ok)
+        self.assertFalse(result.function_ok)
         self.assertFalse(result.advance_op)
 
     def test_function_check_syntax_not_ok(self) -> None:

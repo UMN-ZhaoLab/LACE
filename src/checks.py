@@ -538,7 +538,7 @@ def function_check(state: WorkflowState | dict[str, Any]) -> WorkflowState:
     """
     state = ensure_state(state)
     if state.needs_review:
-        return state.model_copy(update={"function_ok": True, "advance_op": False})
+        return state.model_copy(update={"advance_op": False})
 
     if not state.interface_syntax_ok:
         return state.model_copy(update={"function_ok": False, "advance_op": False})
@@ -560,10 +560,14 @@ def final_function_check(state: WorkflowState | dict[str, Any]) -> WorkflowState
 
     A formal skip (no workspace / untrusted RTL / missing sby) is treated as a
     failure here: we refuse to report success without real verification.
+
+    If needs_review is already set on entry (e.g. the graph re-invoked this
+    node after the formal gate), preserve the existing function_ok rather than
+    forcing it True — otherwise a re-invocation would mask the escalation.
     """
     state = ensure_state(state)
     if state.needs_review:
-        return state.model_copy(update={"function_ok": True, "advance_op": False})
+        return state.model_copy(update={"advance_op": False})
 
     if not state.interface_syntax_ok:
         return state.model_copy(update={"function_ok": False, "advance_op": False})
@@ -576,12 +580,13 @@ def final_function_check(state: WorkflowState | dict[str, Any]) -> WorkflowState
     result = _run_riscv_formal_check(state)
 
     # Escalate any skip into a review: never claim success on unverified code.
-    if not state.needs_review and result.formal_skipped and not result.formal_check_passed:
+    if not result.formal_check_passed:
         notes = list(result.notes)
-        notes.append(
-            "Final check: riscv-formal was skipped, so the integration is "
-            "unverified. Flagging for review."
-        )
+        if result.formal_skipped:
+            notes.append(
+                "Final check: riscv-formal was skipped, so the integration is "
+                "unverified. Flagging for review."
+            )
         return result.model_copy(
             update={
                 "needs_review": True,
