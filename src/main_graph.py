@@ -93,15 +93,6 @@ def route_formal_gate(state: WorkflowState) -> str:
     return route_gate(state, "formal")
 
 
-def finished_arithmetic_syntax(state: WorkflowState) -> str:
-    """Route after arithmetic syntax check: retry on failure, else integrate."""
-    if state.needs_review:
-        return "halt"
-    if state.retry_stage == "arithmetic_writer":
-        return "retry"
-    return "next"
-
-
 def dispatch(state: WorkflowState) -> WorkflowState:
     """No-op dispatch node to fork parallel interface + arithmetic execution."""
     return state
@@ -185,13 +176,11 @@ builder.add_edge("dispatch", "rag_retriever")
 builder.add_edge("dispatch", "arithmetic_writer")
 builder.add_edge("rag_retriever", "interface_writer")
 builder.add_edge("interface_writer", "interface_syntax_check")
-# Arithmetic: write → syntax-check → (retry | integrate | halt)
+# Arithmetic: write → syntax-check → integrate (no retry edge — the parallel
+# fork with the interface branch makes a back-edge unsafe; failures escalate
+# to needs_review and halt).
 builder.add_edge("arithmetic_writer", "check_arithmetic_syntax")
-builder.add_conditional_edges(
-    "check_arithmetic_syntax",
-    finished_arithmetic_syntax,
-    {"retry": "arithmetic_writer", "next": "arithmetic_integrator", "halt": END},
-)
+builder.add_edge("check_arithmetic_syntax", "arithmetic_integrator")
 
 # Interface retry / next-task loop
 builder.add_conditional_edges(

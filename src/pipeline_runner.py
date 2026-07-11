@@ -244,12 +244,24 @@ def run_graph_segment(
 
                     _seen_nodes.add(node_name)
 
-                    # Merge partial update into current state
+                    # Merge partial update into current state.
+                    # LangGraph reducers (e.g. operator.or_ on needs_review,
+                    # list-append on notes) are not honoured by pydantic
+                    # model_copy, so we apply them manually here. This matters
+                    # under the parallel fork/join topology: a retrying branch
+                    # that returns needs_review=False must NOT clear a True set
+                    # by a failing sibling branch, and notes must accumulate.
                     if node_update is None:
                         # LangGraph normalises empty diffs to None; nothing to merge
                         continue
                     if isinstance(node_update, dict):
-                        state = state.model_copy(update=node_update)
+                        merged = dict(node_update)
+                        if "needs_review" in merged and merged["needs_review"] is False:
+                            # operator.or_ semantics: once True, stays True.
+                            merged["needs_review"] = state.needs_review or merged["needs_review"]
+                        if "notes" in merged and isinstance(state.notes, list):
+                            merged["notes"] = list(state.notes) + list(merged["notes"])
+                        state = state.model_copy(update=merged)
                     else:
                         state = ensure_state(node_update)
 

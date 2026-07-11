@@ -221,11 +221,6 @@ def arithmetic_writer(state: WorkflowState | dict[str, Any]) -> WorkflowState:
     if not ops:
         return state
 
-    # Clear any retry signal from the preceding syntax check so the graph
-    # doesn't loop forever after a successful rewrite.
-    if state.retry_stage == "arithmetic_writer":
-        state = state.model_copy(update={"retry_stage": ""})
-
     prompt = build_arithmetic_prompt(state)
 
     # Include the skeleton in the human prompt as a reference for port names.

@@ -143,6 +143,79 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertTrue(state.needs_review)
         self.assertFalse(state.function_ok)
 
+    @patch("src.checks._prepare_riscv_formal_runner")
+    def test_arithmetic_failure_halts_without_retry_loop(
+        self,
+        mock_prepare: MagicMock,
+    ) -> None:
+        """An arithmetic syntax failure must halt with needs_review=True.
+
+        Regression guard: the arithmetic branch runs in parallel with the
+        interface branch (fork at dispatch, join at semantic_port_check). A
+        retry back-edge on the arithmetic branch would be re-driven by
+        interface-branch retries, runaway the retry counter, and let the
+        formal gate clear needs_review — a silent failure. So an arithmetic
+        failure must escalate immediately and arithmetic_writer must run
+        exactly once.
+        """
+        from pathlib import Path
+        from langchain_core.messages import AIMessage
+        from unittest.mock import MagicMock as _MM
+        from src.state_types import (
+            CandidateModulesOut, CpuStructureOut, HdlTasksOut, OpsOut,
+        )
+
+        mock_prepare.return_value = None
+
+        # Mock LLM: interface writer returns a no-op (keep pristine RTL);
+        # arithmetic writer returns broken code containing 'lace_arithmetic'
+        # so the real Verilator mock below can target it.
+        model = _MM()
+        def _wso(schema):
+            r = _MM()
+            def _inv(m):
+                if schema is OpsOut:
+                    return OpsOut(ops=["RdInstr()", "WrRD()"], arithmetic_ops="x", confidence="high")
+                if schema is CpuStructureOut:
+                    return CpuStructureOut(summary="s", module_index=["picorv32.v"])
+                if schema is CandidateModulesOut:
+                    return CandidateModulesOut(candidates=[{"module": "picorv32.v", "reason": "r"}], confidence="high")
+                if schema is HdlTasksOut:
+                    return HdlTasksOut(hdl_tasks=["add wires"], confidence="high")
+                return schema()
+            r.invoke.side_effect = _inv
+            return r
+        model.with_structured_output.side_effect = _wso
+        def _direct_invoke(messages):
+            text = " ".join(getattr(m, "content", "") if not isinstance(m, str) else m for m in messages)
+            if "Required Extension Interface Wires" in text:
+                return AIMessage(content="No changes are needed.")
+            # Broken arithmetic: missing closing paren — real Verilator rejects it.
+            return AIMessage(content="module lace_arithmetic (input clk\n")
+        model.invoke.side_effect = _direct_invoke
+        model.bind_tools = lambda t: model
+        model.bind = lambda **k: model
+
+        with (
+            patch("src.agents.get_chat_model", return_value=model),
+            patch("src.writers.get_chat_model", return_value=model),
+            patch("src.arithmetic_integrator.get_chat_model", return_value=model),
+        ):
+            state, log, _rid = run_graph_segment(
+                spec="Add a custom rotate instruction",
+                cpu_name="picorv32",
+                mock=False,
+            )
+
+        # Must halt in review, NOT silently pass.
+        self.assertTrue(state.needs_review)
+        self.assertFalse(state.arithmetic_syntax_ok)
+        self.assertFalse(state.function_ok)
+        self.assertTrue(state.formal_skipped)
+        # No retry loop: arithmetic_writer runs exactly once.
+        aw_runs = sum(1 for e in log if e["step_name"] == "arithmetic_writer")
+        self.assertEqual(aw_runs, 1, f"arithmetic_writer ran {aw_runs} times (expected 1)")
+
     @patch("src.checks.verilator_syntax_check")
     @patch("src.checks._prepare_riscv_formal_runner")
     def test_graph_resume_from_checkpoint(

@@ -201,10 +201,13 @@ def check_interface_syntax(state: WorkflowState | dict[str, Any]) -> WorkflowSta
 def check_arithmetic_syntax(state: WorkflowState | dict[str, Any]) -> WorkflowState:
     """Check if arithmetic code passes Verilator syntax check.
 
-    On failure, mirrors the interface-writer retry contract: increment
-    arithmetic_retry_count and set retry_stage (without needs_review) while
-    the budget remains, so the graph can route back to arithmetic_writer.
-    Only when the budget is exhausted does this escalate to needs_review.
+    On failure this escalates directly to needs_review rather than looping
+    back to arithmetic_writer. The arithmetic and interface branches run in
+    parallel (fork at ``dispatch``, join at ``semantic_port_check``); a retry
+    edge on the arithmetic branch would be re-driven by interface-branch
+    retries, runaway the retry counter, and let the join gate clear
+    needs_review — a silent failure. Retries are left to the stage-level
+    retry gates that bookend serial stages.
     """
     state = ensure_state(state)
     if not state.arithmetic_code:
@@ -224,23 +227,17 @@ def check_arithmetic_syntax(state: WorkflowState | dict[str, Any]) -> WorkflowSt
             notes.append(out)
 
     if not ok:
-        retry = state.arithmetic_retry_count + 1
-        needs_review = retry > LACEConfig.MAX_TASK_RETRIES
         error_detail = "Arithmetic syntax check failed"
         if out:
             error_detail += f"\n\nVerilator output:\n{out[:2000]}"
-        update: dict[str, Any] = {
-            "arithmetic_syntax_ok": False,
-            "notes": notes,
-            "arithmetic_retry_count": retry,
-            "last_error": error_detail,
-        }
-        if needs_review:
-            update["needs_review"] = True
-        else:
-            # Signal the graph to retry arithmetic_writer.
-            update["retry_stage"] = "arithmetic_writer"
-        return state.model_copy(update=update)
+        return state.model_copy(
+            update={
+                "arithmetic_syntax_ok": False,
+                "notes": notes,
+                "needs_review": True,
+                "last_error": error_detail,
+            }
+        )
     return state.model_copy(update={"arithmetic_syntax_ok": ok, "notes": notes})
 
 
@@ -538,14 +535,33 @@ def function_check(state: WorkflowState | dict[str, Any]) -> WorkflowState:
     """
     state = ensure_state(state)
     if state.needs_review:
-        return state.model_copy(update={"advance_op": False})
+        # An upstream failure already flagged review. Mark formal as skipped
+        # so formal_gate does not treat this as a retryable formal failure
+        # and clear needs_review.
+        return state.model_copy(update={"advance_op": False, "formal_skipped": True})
 
     if not state.interface_syntax_ok:
-        return state.model_copy(update={"function_ok": False, "advance_op": False})
+        return state.model_copy(
+            update={
+                "function_ok": False,
+                "advance_op": False,
+                "needs_review": True,
+                "formal_skipped": True,
+                "last_error": "Interface syntax check did not pass; baseline formal check skipped.",
+            }
+        )
 
     # If arithmetic code exists, it must also pass syntax check
     if state.arithmetic_code and not state.arithmetic_syntax_ok:
-        return state.model_copy(update={"function_ok": False, "advance_op": False})
+        return state.model_copy(
+            update={
+                "function_ok": False,
+                "advance_op": False,
+                "needs_review": True,
+                "formal_skipped": True,
+                "last_error": "Arithmetic syntax check did not pass; baseline formal check skipped.",
+            }
+        )
 
     # Run baseline riscv-formal to verify original ISA is not broken.
     return _run_riscv_formal_baseline(state)
@@ -567,14 +583,33 @@ def final_function_check(state: WorkflowState | dict[str, Any]) -> WorkflowState
     """
     state = ensure_state(state)
     if state.needs_review:
-        return state.model_copy(update={"advance_op": False})
+        # An upstream failure already flagged review. Mark formal as skipped
+        # so formal_gate does not treat this as a retryable formal failure
+        # and clear needs_review.
+        return state.model_copy(update={"advance_op": False, "formal_skipped": True})
 
     if not state.interface_syntax_ok:
-        return state.model_copy(update={"function_ok": False, "advance_op": False})
+        return state.model_copy(
+            update={
+                "function_ok": False,
+                "advance_op": False,
+                "needs_review": True,
+                "formal_skipped": True,
+                "last_error": "Interface syntax check did not pass; final formal check skipped.",
+            }
+        )
 
     # If arithmetic code exists, it must also pass syntax check
     if state.arithmetic_code and not state.arithmetic_syntax_ok:
-        return state.model_copy(update={"function_ok": False, "advance_op": False})
+        return state.model_copy(
+            update={
+                "function_ok": False,
+                "advance_op": False,
+                "needs_review": True,
+                "formal_skipped": True,
+                "last_error": "Arithmetic syntax check did not pass; final formal check skipped.",
+            }
+        )
 
     # Run riscv-formal verification
     result = _run_riscv_formal_check(state)
