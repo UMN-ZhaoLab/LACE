@@ -535,10 +535,19 @@ def function_check(state: WorkflowState | dict[str, Any]) -> WorkflowState:
     """
     state = ensure_state(state)
     if state.needs_review:
-        # An upstream failure already flagged review. Mark formal as skipped
-        # so formal_gate does not treat this as a retryable formal failure
-        # and clear needs_review.
-        return state.model_copy(update={"advance_op": False, "formal_skipped": True})
+        # An upstream failure (or a prior formal failure escalated by this
+        # node) already flagged review. Mark formal as skipped so formal_gate
+        # does not treat this as a retryable formal failure and clear
+        # needs_review — BUT only if we have not already run a real formal
+        # check. If formal_check_results is populated, formal actually ran
+        # and failed; that is not a skip and must not be relabeled as one.
+        already_ran = bool(state.formal_check_results)
+        return state.model_copy(
+            update={
+                "advance_op": False,
+                "formal_skipped": False if already_ran else True,
+            }
+        )
 
     if not state.interface_syntax_ok:
         return state.model_copy(
@@ -583,10 +592,19 @@ def final_function_check(state: WorkflowState | dict[str, Any]) -> WorkflowState
     """
     state = ensure_state(state)
     if state.needs_review:
-        # An upstream failure already flagged review. Mark formal as skipped
-        # so formal_gate does not treat this as a retryable formal failure
-        # and clear needs_review.
-        return state.model_copy(update={"advance_op": False, "formal_skipped": True})
+        # An upstream failure (or a prior formal failure escalated by this
+        # node) already flagged review. Mark formal as skipped so formal_gate
+        # does not treat this as a retryable formal failure and clear
+        # needs_review — BUT only if we have not already run a real formal
+        # check. If formal_check_results is populated, formal actually ran
+        # and failed; that is not a skip and must not be relabeled as one.
+        already_ran = bool(state.formal_check_results)
+        return state.model_copy(
+            update={
+                "advance_op": False,
+                "formal_skipped": False if already_ran else True,
+            }
+        )
 
     if not state.interface_syntax_ok:
         return state.model_copy(
