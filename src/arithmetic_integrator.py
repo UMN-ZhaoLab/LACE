@@ -308,9 +308,39 @@ def arithmetic_integrator(state: WorkflowState | dict[str, Any]) -> WorkflowStat
     notes = list(state.notes)
     notes.append("Arithmetic submodule integrated into picorv32.v")
 
+    # Re-run Verilator lint on the FINAL integrated file. The interface
+    # syntax check ran before integration; the integrator (and _ensure_instance_wires
+    # / _fix_instance_ports) can introduce duplicate declarations or bad
+    # splices that break the file. Without this gate a syntactically broken
+    # CPU would reach the (slow) riscv-formal stage and the syntax_ok flag
+    # would be a false positive.
+    from src.checks import verilator_syntax_check
+
+    ok, out = verilator_syntax_check(
+        integrated_code,
+        include_dir=target_dir or None,
+        verilator_std=state.verilator_std or None,
+        verilator_waive_flags=state.verilator_waive_flags or None,
+    )
+    if not ok:
+        error_detail = "Integrated CPU failed Verilator lint after arithmetic integration"
+        if out:
+            error_detail += f"\n\nVerilator output:\n{out[:2000]}"
+        notes.append(error_detail)
+        return state.model_copy(
+            update={
+                "integrated_interface_code": integrated_code,
+                "interface_syntax_ok": False,
+                "needs_review": True,
+                "last_error": error_detail,
+                "notes": notes,
+            }
+        )
+
     return state.model_copy(
         update={
             "integrated_interface_code": integrated_code,
+            "interface_syntax_ok": True,
             "notes": notes,
         }
     )
