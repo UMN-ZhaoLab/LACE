@@ -36,3 +36,6 @@ cpu_prototype/*/lace_*.sv
 evidence/
 docs/
 AGENTS.md
+
+# --- Reference ISA model (kept locally, not tracked as a submodule) ---
+sail-riscv/
