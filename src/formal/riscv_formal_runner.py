@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -12,25 +13,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import fcntl
+
 from src.config import LACEConfig
+from src.formal.e203_rvfi_adapter import apply_e203_rvfi_adapter
 from src.formal.insn_model import register_custom_instruction, write_insn_model
-from src.formal.isa_manager import configure_riscv_formal_for_custom_instructions
+from src.formal.isa_manager import (
+    configure_riscv_formal_for_custom_instructions,
+    update_checks_cfg,
+)
+from src.formal.sandbox import is_formal_sandbox
 
 logger = logging.getLogger(__name__)
 
-BASELINE_CHECKS = [
-    "cover",
-    "csr_ill_c00_ch0",
-    "csr_ill_c02_ch0",
-    "csr_ill_c80_ch0",
-    "csr_ill_c82_ch0",
-    "csrw_mcycle_ch0",
-    "csrw_minstret_ch0",
-    "csrc_inc_mcycle_ch0",
-    "csrc_inc_minstret_ch0",
-    "csrc_upcnt_mcycle_ch0",
-    "csrc_upcnt_minstret_ch0",
-]
+# ``genchecks.py`` owns the set of instruction proof jobs.  Keep only the
+# non-instruction job here; ``run_baseline_checks`` adds every generated
+# ``insn_*_ch0`` job after generation.  The former hard-coded CSR list was
+# from an older riscv-formal layout and made a healthy run fail merely because
+# those .sby files no longer exist.
+BASELINE_CHECKS = ["cover"]
+
+# e203's private RVFI adapter has been proved against the uncompressed RV32I
+# instruction suite.  Do not claim RVC coverage until its architectural hint
+# behavior is also compatible with the riscv-formal RVC models.
+BASELINE_ISA_BY_CPU = {"e203_hbirdv2": "rv32i"}
 
 
 @dataclass
@@ -84,14 +90,24 @@ class RiscvFormalRunner:
         dst = self.core_dir / cpu_top_file
         if not src.exists():
             raise FileNotFoundError(f"Workspace RTL not found: {src}")
-        shutil.copy2(str(src), str(dst))
+        self._replace_with_copy(src, dst)
 
         # Copy any extra Verilog files (e.g. lace_arithmetic.v)
         for fname in extra_verilog_files or []:
             extra_src = Path(workspace_dir) / fname
             extra_dst = self.core_dir / fname
             if extra_src.exists():
-                shutil.copy2(str(extra_src), str(extra_dst))
+                self._replace_with_copy(extra_src, extra_dst)
+
+    @staticmethod
+    def _replace_with_copy(src: Path, dst: Path) -> None:
+        """Replace a sandbox symlink with a private copy without write-through."""
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_symlink() or dst.is_file():
+            dst.unlink()
+        elif dst.exists():
+            raise IsADirectoryError(f"Expected RTL file but found directory: {dst}")
+        shutil.copy2(src, dst)
 
     def _patch_checks_cfg_for_extra_files(
         self, extra_verilog_files: list[str] | None = None
@@ -128,27 +144,237 @@ class RiscvFormalRunner:
         new_content = content[:section_start] + new_section_body + content[section_end:]
         cfg_path.write_text(new_content, encoding="utf-8")
 
+    def _patch_checks_cfg_for_workspace_sources(
+        self,
+        workspace_dir: str,
+        cpu_top_file: str,
+    ) -> None:
+        """Redirect private formal configs from checkout-relative RTL paths."""
+        cfg_path = self.core_dir / "checks.cfg"
+        if not cfg_path.exists():
+            return
+        workspace = Path(workspace_dir).resolve()
+        content = cfg_path.read_text(encoding="utf-8")
+        prototype_ref = re.compile(r"@basedir@(?:/\.\.)+/cpu_prototype/[^/\s]+")
+        rewritten = prototype_ref.sub(str(workspace), content)
+        has_formal_source_closure = rewritten != content
+
+        section = re.search(
+            r"(\[verilog-files\]\n)(.*?)(?=\n\[|\Z)",
+            rewritten,
+            re.DOTALL,
+        )
+        configured_sources = section.group(2).replace("@core@", self.cpu_name) if section else ""
+        if section and not has_formal_source_closure and cpu_top_file not in configured_sources:
+            top_path = (workspace / cpu_top_file).resolve()
+            # Some prototypes retain both a flattened export and the canonical
+            # RTL tree.  Use the configured top's nearest ``rtl`` ancestor so
+            # the private formal config gets one coherent source closure,
+            # rather than loading duplicate module definitions from both.
+            source_root = workspace
+            for ancestor in (top_path.parent, *top_path.parents):
+                if ancestor.name == "rtl" and ancestor.is_relative_to(workspace):
+                    source_root = ancestor
+                    break
+            sources = sorted({
+                path.resolve()
+                for pattern in ("*.v", "*.sv")
+                for path in source_root.rglob(pattern)
+            })
+            replacement = section.group(1) + "@basedir@/cores/@core@/wrapper.sv\n"
+            replacement += "\n".join(str(path) for path in sources) + "\n"
+            rewritten = rewritten[:section.start()] + replacement + rewritten[section.end():]
+
+            # genchecks emits one ``read -sv`` command from the config.  Its
+            # working directory is the generated check directory, not each
+            # source file's directory, so preserve the source tree's include
+            # search paths through Yosys' generic Verilog defaults.
+            include_dirs = sorted({path.parent for path in sources})
+            defaults = "\n".join(
+                f"verilog_defaults -add -I{directory}" for directory in include_dirs
+            )
+            defaults_section = re.search(
+                r"(\[script-defines\]\n)(.*?)(?=\n\[|\Z)",
+                rewritten,
+                re.DOTALL,
+            )
+            if defaults_section:
+                existing = defaults_section.group(2).rstrip()
+                replacement = defaults_section.group(1) + existing + "\n" + defaults + "\n"
+                rewritten = (
+                    rewritten[:defaults_section.start()]
+                    + replacement
+                    + rewritten[defaults_section.end():]
+                )
+            else:
+                insertion = "[script-defines]\n" + defaults + "\n\n"
+                verilog_section = re.search(r"\[verilog-files\]\n", rewritten)
+                if verilog_section:
+                    rewritten = (
+                        rewritten[:verilog_section.start()]
+                        + insertion
+                        + rewritten[verilog_section.start():]
+                    )
+
+        if rewritten != content:
+            cfg_path.write_text(rewritten, encoding="utf-8")
+
+    def _apply_private_core_adapter(self, workspace_dir: str) -> None:
+        """Apply a CPU-specific formal adapter only to the private sandbox."""
+        if self.cpu_name != "e203_hbirdv2":
+            return
+
+        source = Path(workspace_dir) / "e203_hbirdv2.v"
+        if not source.is_file():
+            raise FileNotFoundError(f"e203 flattened source not found: {source}")
+        destination = self.core_dir / "e203_hbirdv2.v"
+        apply_e203_rvfi_adapter(source, destination)
+
+        cfg_path = self.core_dir / "checks.cfg"
+        content = cfg_path.read_text(encoding="utf-8")
+        private_ref = "@basedir@/cores/@core@/e203_hbirdv2.v"
+        verilog_section = re.search(
+            r"(\[verilog-files\]\n)(.*?)(?=\n\[|\Z)", content, re.DOTALL
+        )
+        if not verilog_section:
+            raise RuntimeError("e203 formal config has no [verilog-files] section")
+        # The flattened e203 export is a self-contained source closure.  Use
+        # it exclusively: earlier runs may have expanded the canonical RTL
+        # tree, which would otherwise duplicate every module definition.
+        private_sources = (
+            verilog_section.group(1)
+            + "@basedir@/cores/@core@/wrapper.sv\n"
+            + private_ref
+            + "\n"
+            + str((Path(workspace_dir) / "rtl" / "e203" / "general" / "*.v").resolve())
+            + "\n"
+        )
+        content = (
+            content[:verilog_section.start()]
+            + private_sources
+            + content[verilog_section.end():]
+        )
+        compressed_define = "`define RISCV_FORMAL_COMPRESSED"
+        if compressed_define not in content:
+            defines_section = re.search(
+                r"(\[defines\]\n)(.*?)(?=\n\[|\Z)", content, re.DOTALL
+            )
+            if not defines_section:
+                raise RuntimeError("e203 formal config has no [defines] section")
+            defines = defines_section.group(1) + defines_section.group(2).rstrip()
+            defines += "\n" + compressed_define + "\n"
+            content = (
+                content[:defines_section.start()]
+                + defines
+                + content[defines_section.end():]
+            )
+        include_dir = (Path(workspace_dir) / "rtl" / "e203" / "general").resolve()
+        include_default = f"verilog_defaults -add -I{include_dir}"
+        if not include_dir.is_dir():
+            raise FileNotFoundError(f"e203 include directory not found: {include_dir}")
+        if include_default not in content:
+            script_defines = re.search(
+                r"(\[script-defines\]\n)(.*?)(?=\n\[|\Z)", content, re.DOTALL
+            )
+            if script_defines:
+                section = script_defines.group(1) + script_defines.group(2).rstrip()
+                section += "\n" + include_default + "\n"
+                content = content[:script_defines.start()] + section + content[script_defines.end():]
+            else:
+                marker = "[verilog-files]\n"
+                content = content.replace(
+                    marker, f"[script-defines]\n{include_default}\n\n{marker}", 1
+                )
+        cfg_path.write_text(content, encoding="utf-8")
+
+    def _sby_environment(self) -> dict[str, str] | None:
+        """Source the complete OSS CAD Suite environment for formal runs."""
+        cfg_path = self.core_dir / "checks.cfg"
+        content = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else ""
+        plugin_match = re.search(r"plugin\s+-i\s+([^\s]+slang\.so)", content)
+
+        suite_root: Path | None = None
+        if plugin_match:
+            suite_root = Path(plugin_match.group(1)).parents[3]
+        else:
+            configured_formal = Path(LACEConfig.RISCV_FORMAL_DIR)
+            if not configured_formal.is_absolute():
+                configured_formal = Path.cwd() / configured_formal
+            formal_root = configured_formal.resolve()
+            candidates = (
+                formal_root.parent / "oss-cad-suite",
+                Path.cwd() / "tools" / "oss-cad-suite",
+                Path.cwd().parent / "tools" / "oss-cad-suite",
+            )
+            suite_root = next(
+                (candidate for candidate in candidates if (candidate / "environment").is_file()),
+                None,
+            )
+
+        if suite_root is None:
+            return None
+        suite_bin = suite_root / "bin"
+        if not (suite_bin / "yosys").is_file() or not (suite_bin / "sby").is_file():
+            return None
+
+        # The release environment also supplies the matching SMT solvers and
+        # Python helpers.  Merely prepending ``bin`` can leave an incompatible
+        # host solver or helper on PATH, so reproduce ``source .../environment``
+        # and pass its exported environment directly to SBY.
+        environment_script = suite_root / "environment"
+        if environment_script.is_file():
+            sourced = subprocess.run(
+                ["bash", "-c", 'source "$1" && env -0', "lace-formal-env", str(environment_script)],
+                capture_output=True,
+                check=False,
+                env=os.environ.copy(),
+            )
+            if sourced.returncode == 0:
+                return {
+                    key.decode("utf-8"): value.decode("utf-8")
+                    for item in sourced.stdout.split(b"\0")
+                    if item and b"=" in item
+                    for key, value in [item.split(b"=", 1)]
+                }
+            logger.warning("Could not source OSS CAD Suite environment: %s", sourced.stderr)
+
+        environment = os.environ.copy()
+        environment["PATH"] = str(suite_bin) + os.pathsep + environment.get("PATH", "")
+        return environment
+
+    def _acquire_sandbox_lock(self) -> Any:
+        """Serialize destructive genchecks/SBY work within one formal sandbox.
+
+        ``genchecks.py`` recreates ``cores/<cpu>/checks``.  A retry or a
+        second graph invocation sharing the same run directory must therefore
+        wait instead of deleting files underneath a live SBY process.
+        """
+        self.core_dir.mkdir(parents=True, exist_ok=True)
+        handle = (self.core_dir / ".lace-formal-run.lock").open("a+")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return handle
+
+    @staticmethod
+    def _release_sandbox_lock(handle: Any | None) -> None:
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
     def _ensure_genchecks_real(self) -> None:
-        """Restore the real genchecks.py if it has been replaced by a stub."""
+        """Validate genchecks.py without ever modifying the source checkout."""
         genchecks = self.riscv_formal_dir / "checks" / "genchecks.py"
         if not genchecks.exists():
             raise FileNotFoundError(f"genchecks.py not found: {genchecks}")
 
         content = genchecks.read_text(encoding="utf-8").strip()
         # A real genchecks.py is much larger than a stub and contains the
-        # canonical header.  If it looks fake, restore it from the submodule.
+        # canonical header. Source checkout repair is intentionally not done
+        # here: the formal runner must never mutate a shared submodule.
         if len(content) < 200 or "Claire Xenia Wolf" not in content:
-            logger.warning("genchecks.py appears to be a stub; restoring from git HEAD")
-            result = subprocess.run(
-                ["git", "checkout", "HEAD", "--", "checks/genchecks.py"],
-                cwd=str(self.riscv_formal_dir),
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"Failed to restore genchecks.py: {result.stderr}")
-            if not genchecks.exists():
-                raise RuntimeError("genchecks.py missing after git restore")
+            raise RuntimeError(f"genchecks.py is not a trusted upstream file: {genchecks}")
 
     def _run_genchecks(self) -> None:
         """Run genchecks.py to regenerate .sby files."""
@@ -164,7 +390,7 @@ class RiscvFormalRunner:
             cwd=str(self.core_dir),
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=LACEConfig.RISCV_FORMAL_GENCHECKS_TIMEOUT,
         )
         if result.returncode != 0:
             raise RuntimeError(f"genchecks.py failed: {result.stderr}")
@@ -176,7 +402,19 @@ class RiscvFormalRunner:
         patched = 0
         for sby_file in self.checks_dir.glob("*.sby"):
             content = sby_file.read_text()
-            new_content, count = pattern.subn(replacement, content)
+            engine_section = re.search(
+                r"(\[engines\]\n)(.*?)(?=\n\[|\Z)",
+                content,
+                re.DOTALL,
+            )
+            if not engine_section:
+                continue
+            engine_body, count = pattern.subn(replacement, engine_section.group(2))
+            new_content = (
+                content[:engine_section.start(2)]
+                + engine_body
+                + content[engine_section.end(2):]
+            )
             if count > 0:
                 sby_file.write_text(new_content)
                 patched += count
@@ -211,6 +449,7 @@ class RiscvFormalRunner:
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
+                env=self._sby_environment(),
             )
             elapsed = time.time() - start
 
@@ -268,6 +507,7 @@ class RiscvFormalRunner:
         custom_insns: list[str] | None = None,
         extra_verilog_files: list[str] | None = None,
         base_isa: str = "rv32imc",
+        generated_instruction_checks: bool = False,
     ) -> dict[str, Any]:
         """Run riscv-formal checks on the modified CPU.
 
@@ -279,6 +519,9 @@ class RiscvFormalRunner:
             custom_insns: Custom instruction names to register (e.g. ["rol"])
             extra_verilog_files: Additional Verilog files to copy (e.g. ["lace_arithmetic.v"])
             base_isa: Base ISA string for riscv-formal configuration
+            generated_instruction_checks: Add every generated ``insn_*_ch0``
+                proof job.  Used for baseline verification so the gate follows
+                the installed riscv-formal version instead of a stale list.
 
         Returns:
             dict with keys: passed (bool), results (list), total_time (float), error (str)
@@ -286,7 +529,23 @@ class RiscvFormalRunner:
         if check_names is None:
             raise ValueError("check_names must be provided; use BASELINE_CHECKS for baseline")
 
+        lock_handle: Any | None = None
         try:
+            if not is_formal_sandbox(self.riscv_formal_dir):
+                raise RuntimeError(
+                    "Refusing to run riscv-formal outside a LACE per-run sandbox"
+                )
+            lock_handle = self._acquire_sandbox_lock()
+
+            if not update_checks_cfg(self.core_dir, base_isa):
+                cfg_path = self.core_dir / "checks.cfg"
+                if not cfg_path.exists() or not re.search(
+                    rf"^isa\s+{re.escape(base_isa)}$",
+                    cfg_path.read_text(encoding="utf-8"),
+                    flags=re.MULTILINE,
+                ):
+                    raise RuntimeError(f"Could not set base ISA in {cfg_path}")
+
             # Configure riscv-formal for custom instructions
             if custom_insns:
                 configure_riscv_formal_for_custom_instructions(
@@ -307,15 +566,31 @@ class RiscvFormalRunner:
                     )
 
             self._copy_rtl(workspace_dir, cpu_top_file, extra_verilog_files)
+            self._patch_checks_cfg_for_workspace_sources(workspace_dir, cpu_top_file)
+            self._apply_private_core_adapter(workspace_dir)
             self._patch_checks_cfg_for_extra_files(extra_verilog_files)
             self._run_genchecks()
             self._patch_solver()
+
+            selected_checks = list(check_names)
+            if generated_instruction_checks:
+                generated = sorted(
+                    path.stem for path in self.checks_dir.glob("insn_*_ch0.sby")
+                )
+                if not generated:
+                    raise RuntimeError(
+                        "genchecks.py generated no insn_*_ch0 baseline proof jobs"
+                    )
+                selected_checks.extend(generated)
+            # Preserve caller order (cover first) while avoiding a duplicate
+            # when a caller explicitly named one of the generated checks.
+            selected_checks = list(dict.fromkeys(selected_checks))
 
             results: list[FormalCheckResult] = []
             all_passed = True
             total_time = 0.0
 
-            for name in check_names:
+            for name in selected_checks:
                 result = self._run_sby_check(name)
                 results.append(result)
                 total_time += result.elapsed_seconds
@@ -349,23 +624,30 @@ class RiscvFormalRunner:
                 "total_time": 0.0,
                 "error": f"{exc}\n{tb}",
             }
+        finally:
+            self._release_sandbox_lock(lock_handle)
 
     def run_baseline_checks(
         self,
         workspace_dir: str,
         cpu_top_file: str,
         extra_verilog_files: list[str] | None = None,
+        base_isa: str | None = None,
     ) -> dict[str, Any]:
-        """Run baseline RV32I checks (cover + CSR checks).
+        """Run all generated baseline instruction checks plus ``cover``.
 
-        These verify that the modified CPU still correctly implements
-        the base RISC-V instruction set.
+        The instruction list is taken from the current riscv-formal
+        ``genchecks.py`` output.  This is intentionally not a hand-maintained
+        subset: missing or renamed generated proof jobs cannot be mistaken for
+        a successful baseline run.
         """
         return self.run_checks(
             workspace_dir,
             cpu_top_file,
             check_names=BASELINE_CHECKS,
             extra_verilog_files=extra_verilog_files,
+            base_isa=base_isa or BASELINE_ISA_BY_CPU.get(self.cpu_name, "rv32imc"),
+            generated_instruction_checks=True,
         )
 
     def run_custom_instruction_checks(

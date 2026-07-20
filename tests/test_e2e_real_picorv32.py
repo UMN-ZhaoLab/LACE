@@ -15,6 +15,7 @@ Skipped automatically when Verilator or the picorv32 submodule is unavailable.
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import unittest
@@ -24,6 +25,8 @@ from unittest.mock import MagicMock, patch
 from langchain_core.messages import AIMessage
 
 from src.config import LACEConfig
+from src.formal.riscv_formal_runner import RiscvFormalRunner
+from src.formal.sandbox import prepare_riscv_formal_sandbox
 from src.pipeline_runner import run_graph_segment
 from src.state_types import (
     CandidateModulesOut,
@@ -35,6 +38,10 @@ from src.state_types import (
 
 PICORV32_TOP = Path("cpu_prototype/picorv32/picorv32.v")
 VERILATOR = shutil.which("verilator")
+SBY = shutil.which("sby")
+YOSYS = shutil.which("yosys")
+Z3 = shutil.which("z3")
+RISCV_FORMAL = Path(LACEConfig.RISCV_FORMAL_DIR)
 
 
 def _make_noop_interface_mock() -> MagicMock:
@@ -86,6 +93,14 @@ def _make_noop_interface_mock() -> MagicMock:
             getattr(m, "content", "") if not isinstance(m, str) else m
             for m in messages
         )
+        if "RTL integration analyst" in text:
+            item = {
+                "file": "picorv32.v", "lines": [1, 1],
+                "signals": ["module"], "excerpt": "module picorv32",
+            }
+            return AIMessage(content=json.dumps({
+                key: item for key in ("decode", "rs1", "rs2", "writeback", "timing")
+            }))
         if "Required Extension Interface Wires" in text:
             return AIMessage(content="No changes are needed; the interface wires are already present.")
         return AIMessage(content="module lace_arithmetic (input clk); endmodule\n")
@@ -151,9 +166,52 @@ class TestE2ERealPicorv32(unittest.TestCase):
         )
         # Arithmetic module lint also runs against real Verilator.
         self.assertTrue(state.arithmetic_syntax_ok)
-        # Formal is skipped (no sby), so the run must end in review, not success.
+        # This lint-focused test forces formal to skip; a skip must end in
+        # review rather than being reported as functional success.
         self.assertTrue(state.formal_skipped)
         self.assertTrue(state.needs_review)
+
+    @unittest.skipUnless(
+        SBY
+        and YOSYS
+        and Z3
+        and (RISCV_FORMAL / "checks" / "genchecks.py").exists()
+        and (RISCV_FORMAL / "cores" / "picorv32" / "checks.cfg").exists(),
+        "riscv-formal toolchain or picorv32 formal target not available",
+    )
+    def test_real_riscv_formal_cover_uses_private_sandbox(self) -> None:
+        """Generate and execute a real SBY check without changing the submodule."""
+        workspace = Path(self._tmp) / "formal-run" / "workspace"
+        workspace.mkdir(parents=True)
+        shutil.copy2(PICORV32_TOP, workspace / "picorv32.v")
+
+        protected_paths = [
+            RISCV_FORMAL / "checks" / "genchecks.py",
+            RISCV_FORMAL / "cores" / "picorv32" / "checks.cfg",
+            RISCV_FORMAL / "cores" / "picorv32" / "picorv32.v",
+        ]
+        before = {path: path.read_bytes() for path in protected_paths}
+        sandbox = prepare_riscv_formal_sandbox(
+            run_id="real-formal-001",
+            cpu_name="picorv32",
+            workspace_dir=str(workspace),
+            source_dir=RISCV_FORMAL,
+        )
+        result = RiscvFormalRunner(
+            cpu_name="picorv32",
+            riscv_formal_dir=str(sandbox),
+            timeout=180,
+        ).run_checks(
+            str(workspace),
+            "picorv32.v",
+            check_names=["cover"],
+        )
+
+        self.assertTrue(result["passed"], result["error"] or result["results"])
+        self.assertEqual([item["name"] for item in result["results"]], ["cover"])
+        self.assertTrue((sandbox / "cores" / "picorv32" / "checks" / "cover.sby").exists())
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content, f"shared source changed: {path}")
 
 
 if __name__ == "__main__":

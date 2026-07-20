@@ -17,6 +17,7 @@ from src.checks import (
     final_function_check,
     function_check,
 )
+from src.config import LACEConfig
 from src.nodes.cpu_resolver import resolve_cpu_state
 from src.nodes.gates import retry_gate, route_gate
 from src.nodes.rag_retriever import rag_retriever
@@ -31,10 +32,11 @@ def finished_interface_syntax_check(state: WorkflowState) -> str:
     Returns:
         "retry"  – current task failed, retry interface_writer.
         "next"   – current task passed and more tasks remain, go back to rag_retriever.
-        "done"   – all tasks done or needs_review is set, proceed to semantic_port_check.
+        "halt"   – a task exhausted its retry budget.
+        "done"   – all tasks passed, proceed to arithmetic generation.
     """
     if state.needs_review:
-        return "done"
+        return "halt"
     if not state.interface_syntax_ok:
         return "retry"
     # Syntax passed – check whether more HDL tasks remain.
@@ -47,17 +49,10 @@ def finished_interface_syntax_check(state: WorkflowState) -> str:
 
 def finished_original_function(state: WorkflowState) -> str:
     """Determine next step after original function check."""
-    if state.needs_review:
-        return "done"
-    # A formal skip is not a code defect — redoing the interface writer will
-    # not conjure an sby toolchain into existence. Proceed to the next stage
-    # and let the final checker escalate the skip into a review.
-    if state.formal_skipped:
-        return "done"
+    if state.needs_review or state.formal_skipped:
+        return "stop"
     if not state.function_ok:
         return "redo"
-    if state.advance_op:
-        return "continue"
     return "done"
 
 
@@ -82,31 +77,60 @@ def route_candidate_gate(state: WorkflowState) -> str:
 
 
 def route_op2hdl_gate(state: WorkflowState) -> str:
-    return route_gate(state, "op_to_hdl_tasks")
+    outcome = route_gate(state, "op_to_hdl_tasks")
+    if outcome != "continue":
+        return outcome
+    if state.op_index + 1 < len(state.ops):
+        return "next"
+    return "continue"
+
+
+def advance_op(state: WorkflowState) -> WorkflowState:
+    """Advance the planner cursor to the next micro-operation."""
+    return state.model_copy(
+        update={
+            "op_index": state.op_index + 1,
+            "hdl_retry_count": 0,
+            "retry_stage": "",
+            "last_error": "",
+        }
+    )
+
+
+def route_arithmetic_syntax(state: WorkflowState) -> str:
+    """Do not integrate arithmetic RTL that failed its syntax gate."""
+    if state.needs_review:
+        return "halt"
+    if not state.arithmetic_syntax_ok:
+        return "retry"
+    return "continue"
+
+
+def route_arithmetic_integration(state: WorkflowState) -> str:
+    """Stop before semantic/formal checks when integrated RTL failed lint."""
+    return "halt" if state.needs_review or not state.interface_syntax_ok else "continue"
 
 
 def formal_gate(state: WorkflowState) -> WorkflowState:
-    return retry_gate(state, "formal", "formal_retry_count")
+    return retry_gate(
+        state,
+        "formal",
+        "formal_retry_count",
+        max_retries=LACEConfig.MAX_FORMAL_RETRIES,
+    )
 
 
 def route_formal_gate(state: WorkflowState) -> str:
     return route_gate(state, "formal")
 
 
-def dispatch(state: WorkflowState) -> WorkflowState:
-    """No-op dispatch node to fork parallel interface + arithmetic execution."""
-    return state
-
-
 def _node_wrapper(fn):
     """Wrap a node function so it only returns modified fields (dict).
 
-    This prevents LangGraph checkpointer from seeing concurrent updates
-    to unchanged fields (e.g. 'spec') when parallel nodes both return
-    full WorkflowState instances.
+    This keeps checkpoints compact when node functions return full
+    WorkflowState instances.
     """
-    # These fields are "stage markers" written by every node and cause
-    # collisions when parallel branches both touch them.
+    # These stage markers are persisted separately by the runner.
     _EXCLUDED = {"last_stage", "last_checkpoint"}
 
     def wrapped(state):
@@ -114,7 +138,7 @@ def _node_wrapper(fn):
         new = fn(old)
         new = ensure_state(new)
         diff = {}
-        for field in old.model_fields:
+        for field in type(old).model_fields:
             if field in _EXCLUDED:
                 continue
             old_val = getattr(old, field)
@@ -135,7 +159,7 @@ builder.add_node("candidate_module_selector", _node_wrapper(select_candidate_mod
 builder.add_node("candidate_gate", _node_wrapper(candidate_gate))
 builder.add_node("op2hdl_planner", _node_wrapper(op_to_hdl_tasks))
 builder.add_node("op2hdl_gate", _node_wrapper(op2hdl_gate))
-builder.add_node("dispatch", _node_wrapper(dispatch))
+builder.add_node("advance_op", _node_wrapper(advance_op))
 builder.add_node("rag_retriever", _node_wrapper(rag_retriever))
 builder.add_node("interface_writer", _node_wrapper(interface_writer))
 builder.add_node("interface_syntax_check", _node_wrapper(check_interface_syntax))
@@ -150,51 +174,61 @@ builder.add_node("formal_gate", _node_wrapper(formal_gate))
 
 builder.add_edge(START, "cpu_resolver")
 builder.add_edge("cpu_resolver", "spec2op_agent")
-builder.add_edge("cpu_resolver", "cpu_structure_analyzer")
 builder.add_edge("spec2op_agent", "spec2op_gate")
-builder.add_edge("cpu_structure_analyzer", "candidate_module_selector")
 builder.add_conditional_edges(
     "spec2op_gate",
     route_spec2op_gate,
-    {"retry": "spec2op_agent", "continue": "candidate_module_selector", "stop": END},
+    {"retry": "spec2op_agent", "continue": "cpu_structure_analyzer", "stop": END},
 )
-builder.add_edge("candidate_module_selector", "candidate_gate")
-builder.add_conditional_edges(
-    "candidate_gate",
-    route_candidate_gate,
-    {"retry": "candidate_module_selector", "continue": "op2hdl_planner", "stop": END},
-)
+builder.add_edge("cpu_structure_analyzer", "op2hdl_planner")
 builder.add_edge("op2hdl_planner", "op2hdl_gate")
 builder.add_conditional_edges(
     "op2hdl_gate",
     route_op2hdl_gate,
-    {"retry": "op2hdl_planner", "continue": "dispatch", "stop": END},
+    {
+        "retry": "op2hdl_planner",
+        "next": "advance_op",
+        "continue": "candidate_module_selector",
+        "stop": END,
+    },
+)
+builder.add_edge("advance_op", "op2hdl_planner")
+builder.add_edge("candidate_module_selector", "candidate_gate")
+builder.add_conditional_edges(
+    "candidate_gate",
+    route_candidate_gate,
+    {"retry": "candidate_module_selector", "continue": "rag_retriever", "stop": END},
 )
 
-# Parallel fork: rag_retriever (for interface) + arithmetic_writer
-builder.add_edge("dispatch", "rag_retriever")
-builder.add_edge("dispatch", "arithmetic_writer")
+# Code generation is intentionally serial. This gives every gate a single
+# predecessor and prevents duplicate join execution or sibling-state races.
 builder.add_edge("rag_retriever", "interface_writer")
 builder.add_edge("interface_writer", "interface_syntax_check")
-# Arithmetic: write → syntax-check → integrate (no retry edge — the parallel
-# fork with the interface branch makes a back-edge unsafe; failures escalate
-# to needs_review and halt).
-builder.add_edge("arithmetic_writer", "check_arithmetic_syntax")
-builder.add_edge("check_arithmetic_syntax", "arithmetic_integrator")
 
 # Interface retry / next-task loop
 builder.add_conditional_edges(
     "interface_syntax_check",
     finished_interface_syntax_check,
     {
-        "done": "semantic_port_check",
+        "done": "arithmetic_writer",
+        "halt": END,
         "retry": "interface_writer",
         "next": "rag_retriever",
     },
 )
 
-# Arithmetic joins at semantic_port_check via integrator
-builder.add_edge("arithmetic_integrator", "semantic_port_check")
+# Arithmetic: write → syntax-check → integrate.
+builder.add_edge("arithmetic_writer", "check_arithmetic_syntax")
+builder.add_conditional_edges(
+    "check_arithmetic_syntax",
+    route_arithmetic_syntax,
+    {"continue": "arithmetic_integrator", "retry": "arithmetic_writer", "halt": END},
+)
+builder.add_conditional_edges(
+    "arithmetic_integrator",
+    route_arithmetic_integration,
+    {"continue": "semantic_port_check", "halt": END},
+)
 
 builder.add_edge("semantic_port_check", "original_function_checker")
 
@@ -203,8 +237,8 @@ builder.add_conditional_edges(
     finished_original_function,
     {
         "done": "insn_model_writer",
-        "continue": "candidate_module_selector",
         "redo": "interface_writer",
+        "stop": END,
     },
 )
 
@@ -215,7 +249,7 @@ builder.add_edge("final_function_checker", "formal_gate")
 builder.add_conditional_edges(
     "formal_gate",
     route_formal_gate,
-    {"retry": "interface_writer", "done": END, "stop": END, "continue": END},
+    {"retry": "final_function_checker", "done": END, "stop": END, "continue": END},
 )
 
 graph = builder.compile()

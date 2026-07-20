@@ -168,9 +168,15 @@ class WorkflowState(BaseModel):
 
     # RAG-extracted relevant code snippets for the current HDL task
     relevant_code: str = ""
+    # Source-backed CPU integration choices selected before the interface
+    # writer edits RTL.  This is deliberately evidence, not a CPU-specific
+    # framework mapping.
+    integration_evidence: Annotated[dict[str, Any], _overwrite] = Field(default_factory=dict)
 
-    # General notes
-    notes: Annotated[List[str], _merge_lists] = Field(default_factory=list)
+    # General notes. Nodes already return the complete accumulated list, so
+    # later writes replace the prior value. An append reducer would duplicate
+    # existing notes on every graph transition.
+    notes: Annotated[List[str], _overwrite] = Field(default_factory=list)
 
     # Formal verification flags
     formal_check_passed: Annotated[bool, _overwrite] = False
@@ -180,6 +186,10 @@ class WorkflowState(BaseModel):
     # mock RTL, or missing sby toolchain). Distinct from a real pass/fail so
     # downstream nodes never mistake a skip for success.
     formal_skipped: Annotated[bool, _overwrite] = False
+    # Non-retryable formal setup/model failure. This is distinct from a
+    # missing external toolchain (formal_skipped) and prevents the formal gate
+    # from retrying an unrelated RTL writer.
+    formal_terminal: Annotated[bool, _overwrite] = False
 
     # Custom instruction model (populated by insn_model_writer)
     custom_insn_names: Annotated[List[str], _overwrite] = Field(default_factory=list)
@@ -193,7 +203,9 @@ class WorkflowState(BaseModel):
     run_id: str = ""
     last_stage: str = ""
     last_checkpoint: CheckpointPayload = Field(default_factory=CheckpointPayload)
-    needs_review: Annotated[bool, operator.or_] = False
+    # The graph is serial after code-generation ordering is established, so a
+    # retry gate must be able to clear this flag for a bounded retry attempt.
+    needs_review: Annotated[bool, _overwrite] = False
 
     # Confidence scores
     spec_confidence: float = 0.0

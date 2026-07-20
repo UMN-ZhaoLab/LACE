@@ -16,7 +16,7 @@ def retry_gate(
     """Generic retry gate: increment counter, reset needs_review, or persist failure.
 
     In graph mode ``last_stage`` is not propagated (it is excluded from node
-    diffs to avoid parallel-branch collisions), so we gate purely on
+    diffs to keep state transitions deterministic), so we gate purely on
     ``needs_review``.  The graph topology already guarantees the gate follows
     the agent that produced the review flag.
 
@@ -25,7 +25,7 @@ def retry_gate(
     skip is escalated to needs_review by the final checker and must NOT be
     cleared here; instead it is routed straight to stop by route_gate.
     """
-    if state.formal_skipped and stage == "formal":
+    if (state.formal_skipped or state.formal_terminal) and stage == "formal":
         # Preserve needs_review so the run ends in review, not a silent pass.
         return state.model_copy(update={"retry_stage": ""})
 
@@ -51,7 +51,7 @@ def retry_gate(
 def route_gate(state: WorkflowState, stage: str) -> str:
     """Generic router for retry gates: retry / stop / continue."""
     # A formal skip must terminate in review rather than loop back.
-    if state.formal_skipped and stage == "formal":
+    if (state.formal_skipped or state.formal_terminal) and stage == "formal":
         return "stop"
     if state.retry_stage == stage:
         return "retry"

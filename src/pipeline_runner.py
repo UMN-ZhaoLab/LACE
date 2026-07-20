@@ -52,11 +52,11 @@ def _graph_node_names() -> list[str]:
             "spec2op_agent",
             "spec2op_gate",
             "cpu_structure_analyzer",
-            "candidate_module_selector",
-            "candidate_gate",
             "op2hdl_planner",
             "op2hdl_gate",
-            "dispatch",
+            "advance_op",
+            "candidate_module_selector",
+            "candidate_gate",
             "rag_retriever",
             "interface_writer",
             "interface_syntax_check",
@@ -127,6 +127,30 @@ def _make_mock_llm() -> MagicMock:
     model.with_structured_output.side_effect = _with_structured_output
 
     def _direct_invoke(messages: Any) -> AIMessage:
+        prompt_text = " ".join(
+            str(getattr(message, "content", message)) for message in messages
+        )
+        if "RTL integration analyst" in prompt_text:
+            # Keep graph topology tests independent of a real model while
+            # satisfying the same source-evidence contract as production.
+            import json
+            import re
+
+            match = re.search(r"### ([^:\s]+):\d+-\d+\n(.+?)(?=\s+### |$)", prompt_text, re.DOTALL)
+            if match:
+                file_name, excerpt = match.groups()
+                excerpt = excerpt.strip()
+            else:
+                file_name, excerpt = "picorv32.v", "module picorv32;"
+            identifier = re.search(r"[A-Za-z_][A-Za-z0-9_$]*", excerpt)
+            item = {
+                "file": file_name, "lines": [1, 1],
+                "signals": [identifier.group(0) if identifier else "module"],
+                "excerpt": excerpt,
+            }
+            return AIMessage(content=json.dumps({key: item for key in ("decode", "rs1", "rs2", "writeback", "timing")}))
+        if "rvfi_insn_" in prompt_text or "instruction model" in prompt_text.lower():
+            return AIMessage(content="module rvfi_insn_mock (); endmodule")
         return AIMessage(content="module top; // mock generated code\nendmodule")
 
     model.invoke.side_effect = _direct_invoke
@@ -156,8 +180,8 @@ def run_graph_segment(
 ) -> tuple[WorkflowState, list[dict[str, Any]], str]:
     """Execute pipeline using the compiled LangGraph graph with checkpointing.
 
-    Reuses src.main_graph.builder so that conditional edges, retry gates,
-    and parallel forks are honoured.  A SqliteSaver checkpointer provides
+    Reuses src.main_graph.builder so that conditional edges and retry gates
+    are honoured. A SqliteSaver checkpointer provides
     true resume semantics (stream(None, config) continues from the last
     saved superstep).
     """
@@ -179,7 +203,9 @@ def run_graph_segment(
     checkpointer = SqliteSaver(conn)
     graph = builder.compile(checkpointer=checkpointer)
 
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+    # Multi-op planning and per-op interface generation intentionally loop in
+    # the graph; leave enough headroom for larger instruction decompositions.
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 200}
 
     # Resume when parent_run_id is given or when both run_id + start_from are given
     is_resume = bool(parent_run_id or (run_id and start_from))
@@ -244,24 +270,14 @@ def run_graph_segment(
 
                     _seen_nodes.add(node_name)
 
-                    # Merge partial update into current state.
-                    # LangGraph reducers (e.g. operator.or_ on needs_review,
-                    # list-append on notes) are not honoured by pydantic
-                    # model_copy, so we apply them manually here. This matters
-                    # under the parallel fork/join topology: a retrying branch
-                    # that returns needs_review=False must NOT clear a True set
-                    # by a failing sibling branch, and notes must accumulate.
+                    # Merge the partial update for reporting. The graph is
+                    # serial, and nodes return complete values for list fields,
+                    # so normal overwrite semantics match the graph state.
                     if node_update is None:
                         # LangGraph normalises empty diffs to None; nothing to merge
                         continue
                     if isinstance(node_update, dict):
-                        merged = dict(node_update)
-                        if "needs_review" in merged and merged["needs_review"] is False:
-                            # operator.or_ semantics: once True, stays True.
-                            merged["needs_review"] = state.needs_review or merged["needs_review"]
-                        if "notes" in merged and isinstance(state.notes, list):
-                            merged["notes"] = list(state.notes) + list(merged["notes"])
-                        state = state.model_copy(update=merged)
+                        state = state.model_copy(update=dict(node_update))
                     else:
                         state = ensure_state(node_update)
 
@@ -282,12 +298,11 @@ def run_graph_segment(
                     save_step_output(rid, len(log) - 1, node_name, status, error)
                     insert_step(rid, len(log) - 1, node_name, status, error)
 
-                # stop_at handling — evaluated after the full superstep so parallel
-                # nodes (e.g. cpu_structure_analyzer) are always logged.
+                # stop_at handling is evaluated after the full superstep.
                 if stop_at:
                     if stop_at == "spec_and_cpu":
-                        # Wait until both parallel branches have run and the retry
-                        # gate has had a chance to fire (or pass) before stopping.
+                        # Preserve the historical aggregate stop name: wait until
+                        # both stages and the retry gate have completed.
                         if (
                             "spec2op_agent" in _seen_nodes
                             and "cpu_structure_analyzer" in _seen_nodes

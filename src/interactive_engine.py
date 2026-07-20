@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -488,10 +489,20 @@ def merge_candidate_result(
 def merge_op2hdl_result(state: WorkflowState, hdl_out: HdlTasksOut) -> WorkflowState:
     """Merge op→HDL tasks result into state."""
     score = confidence_score(hdl_out.confidence)
-    op_index_map = [state.op_index] * len(hdl_out.hdl_tasks)
+    # Preserve plans for all other operations. On a retry, replace only the
+    # current op's tasks instead of appending duplicates.
+    retained = [
+        (task, op_idx)
+        for task, op_idx in zip(state.hdl_tasks, state.hdl_task_op_index_map)
+        if op_idx != state.op_index
+    ]
+    retained_tasks = [task for task, _ in retained]
+    retained_map = [op_idx for _, op_idx in retained]
+    merged_tasks = retained_tasks + list(hdl_out.hdl_tasks)
+    op_index_map = retained_map + [state.op_index] * len(hdl_out.hdl_tasks)
     updated = state.model_copy(
         update={
-            "hdl_tasks": hdl_out.hdl_tasks,
+            "hdl_tasks": merged_tasks,
             "hdl_task_op_index_map": op_index_map,
             "hdl_confidence": score,
         }
@@ -704,15 +715,12 @@ def build_interface_prompt(state: WorkflowState) -> dict[str, Any]:
 
     human_parts.append(
         "\n## Instructions\n"
-        "1. The COMPLETE original file is provided above. Use it directly to find exact text.\n"
+        "1. Complete source files selected by validated RTL evidence are provided below. Use them directly to find exact text.\n"
         "2. Create INTERNAL WIRES for the extension interface. Do NOT add new top-level ports.\n"
-        "3. For the writeback task (WrRD): route `WrRD_2_i` to the CPU's natural result/writeback signal "
-        "(e.g., `reg_out` or `alu_out` in picorv32, or the pipeline writeback mux). "
+        "3. For the writeback task (WrRD): route `WrRD_2_i` to the source-proven normal result/writeback signal. "
         "Reuse the existing rd writeback enable/logic; do NOT create a separate bypass or gate with `instr_rol`.\n"
-        "4. Check for encoding collisions with existing custom instructions in the same opcode/funct7 space "
-        "(e.g., picorv32 getq/setq/retirq) and add exclusion conditions to the existing decode signals if needed.\n"
-        "5. Add decode logic in EVERY path where instruction decode registers are assigned. In multi-path CPUs (e.g., picorv32 has "
-        "both `mem_rdata_latched` and `mem_rdata_q` paths) the custom decode must appear in each path.\n"
+        "4. Check for encoding collisions with existing instructions in the source-proven decode space and add exclusion conditions if needed.\n"
+        "5. Add decode logic in every source-proven decode path that can execute the instruction.\n"
         "6. Check RVFI overlap: if existing custom instructions have `casez` patterns that would match the new instruction, "
         "update those patterns with the same exclusion conditions used for decode. Otherwise do NOT modify RVFI signals.\n"
         "7. Complete ALL tasks listed above in a single response.\n"
@@ -851,7 +859,33 @@ def _replace_module_declaration(original: str, new_decl: str) -> str:
     return result
 
 
-def merge_interface_result(state: WorkflowState, raw_code: str) -> WorkflowState:
+def _split_file_scoped_patches(raw_code: str) -> dict[str, str]:
+    """Extract ``FILE: path`` scoped SEARCH/REPLACE payloads.
+
+    Paths are validated by the caller against its run workspace.  Keeping this
+    format here makes multi-module integration possible without a CPU-specific
+    module map.
+    """
+    matches = list(re.finditer(r"(?m)^FILE:\s*([^\n]+)\s*$", raw_code))
+    if not matches:
+        return {}
+    patches: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        path = match.group(1).strip()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_code)
+        payload = raw_code[match.end():end].strip()
+        if not payload:
+            raise ValueError(f"Empty patch payload for FILE: {path}")
+        patches[path] = payload
+    return patches
+
+
+def merge_interface_result(
+    state: WorkflowState,
+    raw_code: str,
+    *,
+    evidence: dict[str, Any] | None = None,
+) -> WorkflowState:
     """Parse generated code, write it back to the workspace, and update state."""
     target_dir = _get_target_dir(state)
     # Always use the *full* original file as the base for patching so that
@@ -888,29 +922,56 @@ def merge_interface_result(state: WorkflowState, raw_code: str) -> WorkflowState
         return state.model_copy(update={"interface_code": original_code})
 
     try:
-        updated_code = _parse_model_response(raw_code, original_code)
+        scoped_patches = _split_file_scoped_patches(raw_code)
+        if scoped_patches:
+            if not target_dir:
+                raise ValueError("No workspace available for file-scoped patches")
+            workspace = Path(target_dir).resolve()
+            allowed_files = {
+                item.get("file")
+                for item in (evidence or {}).values()
+                if isinstance(item, dict) and isinstance(item.get("file"), str)
+            }
+            if not allowed_files:
+                raise ValueError("File-scoped patches require validated RTL discovery evidence")
+            for relative, payload in scoped_patches.items():
+                if relative not in allowed_files:
+                    raise ValueError(f"Patch file is not backed by RTL evidence: {relative}")
+                path = (workspace / relative).resolve()
+                if workspace not in path.parents or not path.exists():
+                    raise ValueError(f"Invalid workspace patch path: {relative}")
+                source = path.read_text(encoding="utf-8")
+                updated = _parse_model_response(payload, source)
+                if len(updated) < len(source) * SNIPPET_TOO_SHORT_RATIO and not updated.strip().startswith("module "):
+                    raise ValueError(f"Patch for {relative} is not a complete SEARCH/REPLACE result")
+                path.write_text(updated, encoding="utf-8")
+            updated_code = original_code
+            if target_dir and state.cpu_top_file:
+                updated_code = (Path(target_dir) / state.cpu_top_file).read_text(encoding="utf-8")
+        else:
+            updated_code = _parse_model_response(raw_code, original_code)
 
         # Fallback: if the LLM returned a bare module declaration (shorter than
         # the original file), splice it back into the full file.
-        if (
+            if (
             updated_code.strip().startswith("module ")
             and len(updated_code) < len(original_code) * MODULE_DECL_SHORT_RATIO
-        ):
-            updated_code = _replace_module_declaration(original_code, updated_code)
+            ):
+                updated_code = _replace_module_declaration(original_code, updated_code)
 
         # Guard against raw snippets that are not SEARCH/REPLACE blocks and not
         # complete module declarations.
         # A valid response must either be a full file (roughly same size as original)
         # or a complete module declaration (starts with "module ").
-        if (
+            if (
             original_code
             and len(updated_code) < len(original_code) * SNIPPET_TOO_SHORT_RATIO
             and not updated_code.strip().startswith("module ")
-        ):
-            raise ValueError(
-                "LLM returned a code snippet without SEARCH/REPLACE blocks. "
-                "Expected SEARCH/REPLACE format for incremental modifications."
-            )
+            ):
+                raise ValueError(
+                    "LLM returned a code snippet without SEARCH/REPLACE blocks. "
+                    "Expected SEARCH/REPLACE format for incremental modifications."
+                )
     except Exception as exc:
         err_msg = str(exc)
         # A no-op diff (SEARCH == REPLACE) means the LLM believes the code is
@@ -932,7 +993,7 @@ def merge_interface_result(state: WorkflowState, raw_code: str) -> WorkflowState
         )
 
     target_dir = _get_target_dir(state)
-    if target_dir and state.cpu_top_file:
+    if target_dir and state.cpu_top_file and not _split_file_scoped_patches(raw_code):
         out_path = Path(target_dir) / state.cpu_top_file
         out_path.write_text(updated_code, encoding="utf-8")
 
@@ -946,7 +1007,10 @@ def merge_interface_result(state: WorkflowState, raw_code: str) -> WorkflowState
         except Exception:
             pass
 
-    return state.model_copy(update={"interface_code": updated_code})
+    return state.model_copy(update={
+        "interface_code": updated_code,
+        "integration_evidence": evidence or state.integration_evidence,
+    })
 
 
 def build_arithmetic_prompt(state: WorkflowState) -> dict[str, Any]:
@@ -978,7 +1042,7 @@ def build_arithmetic_prompt(state: WorkflowState) -> dict[str, Any]:
         human_parts.extend([
             "## Target CPU Summary\n\n",
             f"{state.cpu_summary}\n\n",
-            "If the CPU is multi-cycle / non-pipelined (e.g., picorv32), generate COMBINATIONAL outputs; "
+            "If the CPU is multi-cycle / non-pipelined, generate COMBINATIONAL outputs; "
             "do NOT pipeline the result or valid signal with clocked registers.\n\n",
         ])
 
@@ -1007,6 +1071,13 @@ def build_arithmetic_prompt(state: WorkflowState) -> dict[str, Any]:
             "```sail\n",
             state.arithmetic_ops,
             "\n```\n",
+        ])
+
+    if state.arithmetic_retry_count > 0 and state.last_error:
+        human_parts.extend([
+            f"\n## Previous Arithmetic Attempt Failed (retry {state.arithmetic_retry_count})\n\n",
+            f"Verilator reported:\n{state.last_error}\n",
+            "Generate a corrected complete module. Do not repeat the failing construct.\n",
         ])
 
     human_content = "".join(human_parts)
@@ -1082,9 +1153,9 @@ def merge_insn_model_result(
     """
     import re
 
-    from src.formal.insn_model import write_insn_model
+    from src.formal.insn_model import normalize_rd_wdata_x0, write_insn_model
 
-    code = strip_code_fences(raw_code).rstrip()
+    code = normalize_rd_wdata_x0(strip_code_fences(raw_code).rstrip())
 
     # Extract instruction name from module declaration
     match = re.search(r"module\s+rvfi_insn_(\w+)\s*\(", code)
@@ -1110,6 +1181,68 @@ def merge_insn_model_result(
 # ---------------------------------------------------------------------------
 # Step registry
 # ---------------------------------------------------------------------------
+
+
+def _validate_nonempty_text(raw: Any) -> tuple[bool, str, str]:
+    text = raw if isinstance(raw, str) else str(raw)
+    if not text.strip():
+        return False, "LLM output must not be empty", text
+    return True, "ok", text
+
+
+def _build_arithmetic_integration_prompt(state: WorkflowState) -> dict[str, Any]:
+    from src.arithmetic_integrator import _build_integration_prompt
+
+    return _build_integration_prompt(state)
+
+
+def _merge_arithmetic_integration(state: WorkflowState, raw: str) -> WorkflowState:
+    from src.arithmetic_integrator import arithmetic_integrator
+
+    return arithmetic_integrator(state, raw_output=raw)
+
+
+def _merge_interactive_insn_model(state: WorkflowState, raw: str) -> WorkflowState:
+    from src.formal.sandbox import prepare_riscv_formal_sandbox
+
+    try:
+        sandbox = prepare_riscv_formal_sandbox(
+            run_id=state.run_id,
+            cpu_name=state.cpu_name,
+            workspace_dir=state.workspace_dir,
+        )
+    except Exception as exc:
+        notes = list(state.notes)
+        notes.append(f"Instruction-model sandbox setup failed: {exc}")
+        return state.model_copy(
+            update={
+                "needs_review": True,
+                "formal_terminal": True,
+                "last_error": f"Instruction-model sandbox setup failed: {exc}",
+                "notes": notes,
+            }
+        )
+    return merge_insn_model_result(state, raw, sandbox)
+
+
+def _local_prompt(step_name: str) -> Callable[[WorkflowState], dict[str, Any]]:
+    return lambda _state: {
+        "local": True,
+        "system": "",
+        "human": f"Call lace_advance_state for local step '{step_name}' with an empty raw_output.",
+        "notes": ["This step runs locally and consumes no LLM API call."],
+    }
+
+
+def _local_handler(step_name: str, description: str) -> StepHandler:
+    return StepHandler(
+        name=step_name,
+        build_prompt=_local_prompt(step_name),
+        validate_output=lambda _raw: (True, "ok", None),
+        merge_result=lambda state, _parsed: state,
+        description=description,
+        needs_llm=False,
+    )
 
 STEP_REGISTRY: dict[str, StepHandler] = {
     "spec_to_ops": StepHandler(
@@ -1142,10 +1275,86 @@ STEP_REGISTRY: dict[str, StepHandler] = {
         merge_result=merge_op2hdl_result,
         description="Plan HDL modification tasks for the current operation.",
     ),
+    "interface_writer": StepHandler(
+        name="interface_writer",
+        build_prompt=build_interface_prompt,
+        validate_output=_validate_nonempty_text,
+        merge_result=merge_interface_result,
+        description="Generate and apply the current CPU-interface RTL change.",
+    ),
+    "arithmetic_writer": StepHandler(
+        name="arithmetic_writer",
+        build_prompt=build_arithmetic_prompt,
+        validate_output=_validate_nonempty_text,
+        merge_result=merge_arithmetic_result,
+        description="Generate the custom instruction arithmetic RTL module.",
+    ),
+    "arithmetic_integrator": StepHandler(
+        name="arithmetic_integrator",
+        build_prompt=_build_arithmetic_integration_prompt,
+        validate_output=_validate_nonempty_text,
+        merge_result=_merge_arithmetic_integration,
+        description="Integrate the arithmetic module into the modified CPU top.",
+    ),
+    "insn_model_writer": StepHandler(
+        name="insn_model_writer",
+        build_prompt=build_insn_model_prompt,
+        validate_output=_validate_nonempty_text,
+        merge_result=_merge_interactive_insn_model,
+        description="Generate the riscv-formal instruction specification model.",
+    ),
+    "cpu_resolver": _local_handler("cpu_resolver", "Resolve CPU configuration and create the run workspace."),
+    "advance_op": _local_handler("advance_op", "Advance to the next operation to plan."),
+    "rag_retriever": _local_handler("rag_retriever", "Retrieve RTL context for the current HDL task."),
+    "interface_syntax_check": _local_handler("interface_syntax_check", "Run Verilator syntax lint on the modified CPU RTL."),
+    "check_arithmetic_syntax": _local_handler("check_arithmetic_syntax", "Run Verilator syntax lint on the arithmetic RTL."),
+    "semantic_port_check": _local_handler("semantic_port_check", "Check generated interface/arithmetic port consistency."),
+    "original_function_checker": _local_handler("original_function_checker", "Run riscv-formal baseline checks."),
+    "final_function_checker": _local_handler("final_function_checker", "Run baseline and custom-instruction riscv-formal checks."),
 }
 
-# Steps that are handled locally without LLM (checks, writers)
-LOCAL_STEP_NAMES = {"interface_writer", "arithmetic_writer", "semantic_port_check", "function_check"}
+LOCAL_STEP_NAMES = {
+    name for name, handler in STEP_REGISTRY.items() if not handler.needs_llm
+}
+
+
+def _run_local_step(state: WorkflowState, step_name: str) -> WorkflowState:
+    if step_name == "cpu_resolver":
+        return resolve_cpu_and_state(state)
+    if step_name == "advance_op":
+        return state.model_copy(
+            update={
+                "op_index": state.op_index + 1,
+                "hdl_retry_count": 0,
+                "retry_stage": "",
+                "last_error": "",
+            }
+        )
+    if step_name == "rag_retriever":
+        from src.nodes.rag_retriever import rag_retriever
+
+        return rag_retriever(state)
+    if step_name == "interface_syntax_check":
+        from src.checks import check_interface_syntax
+
+        return check_interface_syntax(state)
+    if step_name == "check_arithmetic_syntax":
+        from src.checks import check_arithmetic_syntax
+
+        return check_arithmetic_syntax(state)
+    if step_name == "semantic_port_check":
+        from src.checks import check_semantic_ports
+
+        return check_semantic_ports(state)
+    if step_name == "original_function_checker":
+        from src.checks import function_check
+
+        return function_check(state)
+    if step_name == "final_function_checker":
+        from src.checks import final_function_check
+
+        return final_function_check(state)
+    raise ValueError(f"Unknown local step: {step_name}")
 
 
 def get_current_step(state: WorkflowState) -> str | None:
@@ -1159,15 +1368,40 @@ def get_current_step(state: WorkflowState) -> str | None:
         return "spec_to_ops"
     if not state.cpu_summary and state.cpu_dir:
         return "cpu_analysis"
+    current_op_planned = state.op_index in state.hdl_task_op_index_map
+    if not current_op_planned:
+        return "op2hdl_tasks"
+    if state.op_index + 1 < len(state.ops):
+        return "advance_op"
     if not state.candidate_modules:
         return "candidate_modules"
-    if not state.hdl_tasks:
-        return "op2hdl_tasks"
-    if state.hdl_index < len(state.hdl_tasks) and not state.interface_syntax_ok:
-        return "interface_writer"
+    if state.needs_review:
+        return None
+    if state.hdl_index < len(state.hdl_tasks):
+        if state.last_stage == "rag_retriever":
+            return "interface_writer"
+        if state.last_stage == "interface_writer":
+            return "interface_syntax_check"
+        if state.last_stage == "interface_syntax_check" and not state.interface_syntax_ok:
+            return "interface_writer"
+        return "rag_retriever"
     if not state.arithmetic_code:
         return "arithmetic_writer"
-    return None
+    if not state.arithmetic_syntax_ok:
+        return "check_arithmetic_syntax"
+    if not state.integrated_interface_code:
+        return "arithmetic_integrator"
+    if state.last_stage == "arithmetic_integrator":
+        return "semantic_port_check"
+    if state.last_stage == "semantic_port_check":
+        return "original_function_checker"
+    if state.last_stage == "original_function_checker":
+        return "insn_model_writer"
+    if state.last_stage == "insn_model_writer":
+        return "final_function_checker"
+    if state.last_stage == "final_function_checker":
+        return None
+    return "semantic_port_check"
 
 
 def get_workflow_status(state: WorkflowState) -> dict[str, Any]:
@@ -1180,8 +1414,14 @@ def get_workflow_status(state: WorkflowState) -> dict[str, Any]:
         ("op2hdl_tasks", bool(state.hdl_tasks)),
         ("interface_writer", state.interface_syntax_ok),
         ("arithmetic_writer", bool(state.arithmetic_code)),
-        ("semantic_port_check", state.interface_syntax_ok and bool(state.arithmetic_code)),
-        ("function_check", state.function_ok),
+        ("arithmetic_integrator", bool(state.integrated_interface_code)),
+        ("semantic_port_check", state.last_stage in {
+            "semantic_port_check", "original_function_checker", "insn_model_writer",
+            "final_function_checker",
+        }),
+        ("original_function_checker", bool(state.formal_check_results.get("baseline"))),
+        ("insn_model_writer", bool(state.insn_model_code)),
+        ("final_function_checker", state.formal_check_passed),
     ]
     return {
         "current_step": get_current_step(state),
@@ -1204,7 +1444,9 @@ def resolve_cpu_and_state(state: WorkflowState | dict[str, Any]) -> WorkflowStat
 
     state = ensure_state(state)
     if not state.run_id:
-        state = state.model_copy(update={"run_id": LACEConfig.ARTIFACT_DIR})
+        state = state.model_copy(
+            update={"run_id": f"interactive-{uuid.uuid4().hex[:12]}"}
+        )
     return resolve_cpu_state(state)
 
 
@@ -1225,6 +1467,31 @@ def advance_step(
     if handler is None:
         raise ValueError(f"Unknown step: {step_name}")
 
+    if not handler.needs_llm:
+        try:
+            updated = _run_local_step(state, step_name).model_copy(
+                update={"last_stage": step_name}
+            )
+            return updated, {
+                "step": step_name,
+                "valid": True,
+                "error": "",
+                "confidence": None,
+                "local": True,
+            }
+        except Exception as exc:
+            error = f"Local step {step_name} failed: {exc}"
+            updated = state.model_copy(
+                update={"needs_review": True, "last_error": error, "last_stage": step_name}
+            )
+            return updated, {
+                "step": step_name,
+                "valid": False,
+                "error": error,
+                "confidence": None,
+                "local": True,
+            }
+
     valid, error, parsed = handler.validate_output(raw_output)
     log = {
         "step": step_name,
@@ -1241,5 +1508,7 @@ def advance_step(
     if hasattr(parsed, "confidence"):
         log["confidence"] = confidence_score(parsed.confidence)
 
-    updated = handler.merge_result(state, parsed)
+    updated = handler.merge_result(state, parsed).model_copy(
+        update={"last_stage": step_name}
+    )
     return updated, log

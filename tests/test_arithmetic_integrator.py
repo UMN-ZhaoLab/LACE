@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import unittest
 
-from src.arithmetic_integrator import _build_integration_prompt, _ensure_instance_wires, _fix_instance_ports
+from src.arithmetic_integrator import (
+    _build_integration_prompt,
+    _ensure_instance_wires,
+    _fix_instance_ports,
+    _remove_submodule_output_drivers,
+)
 from src.state_types import WorkflowState
 
 
@@ -99,6 +104,67 @@ endmodule
         self.assertIn(".WrRD_validReq_2_o", fixed)
         self.assertIn("(my_valid)", fixed)
 
+    def test_fix_instance_ports_drops_operand_passthrough_outputs(self) -> None:
+        arithmetic = """\
+module lace_arithmetic (
+    output wire [31:0] RdRS1_1_o,
+    output wire [31:0] RdRS2_1_o,
+    input  wire [31:0] RdRS1_1_i,
+    input  wire [31:0] RdRS2_1_i,
+    output wire [31:0] WrRD_2_o
+);
+endmodule
+"""
+        cpu = """\
+module picorv32;
+    lace_arithmetic u_lace_arithmetic (
+        .RdRS1_1_o(RdRS1_1_o),
+        .RdRS2_1_o(RdRS2_1_o),
+        .RdRS1_1_i(RdRS1_1_o),
+        .RdRS2_1_i(RdRS2_1_o),
+        .WrRD_2_o(WrRD_2_i)
+    );
+endmodule
+"""
+        fixed = _fix_instance_ports(cpu, arithmetic)
+        self.assertNotIn(".RdRS1_1_o", fixed)
+        self.assertNotIn(".RdRS2_1_o", fixed)
+        self.assertIn(".RdRS1_1_i", fixed)
+        self.assertIn(".RdRS2_1_i", fixed)
+        self.assertIn(".WrRD_2_o", fixed)
+
+    def test_submodule_outputs_are_single_driver_wires(self) -> None:
+        arithmetic = """\
+module lace_arithmetic (
+    output reg [31:0] WrRD_2_o,
+    output reg WrRD_validReq_2_o,
+    input [31:0] RdInstr_0_i
+);
+endmodule
+"""
+        cpu = """\
+module picorv32 (input clk);
+    reg [31:0] WrRD_2_i;
+    reg WrRD_validReq_2_i;
+    always @(posedge clk) begin
+        WrRD_2_i <= 0;
+        WrRD_validReq_2_i <= 0;
+    end
+    wire use_result = WrRD_validReq_2_i;
+    lace_arithmetic u_lace_arithmetic (
+        .WrRD_2_o(WrRD_2_i),
+        .WrRD_validReq_2_o(WrRD_validReq_2_i),
+        .RdInstr_0_i(32'b0)
+    );
+endmodule
+"""
+        fixed = _remove_submodule_output_drivers(cpu, arithmetic)
+        self.assertIn("wire [31:0] WrRD_2_i;", fixed)
+        self.assertIn("wire WrRD_validReq_2_i;", fixed)
+        self.assertNotIn("WrRD_2_i <=", fixed)
+        self.assertNotIn("WrRD_validReq_2_i <=", fixed)
+        self.assertIn("wire use_result = WrRD_validReq_2_i;", fixed)
+
     def test_integration_prompt_reinforces_native_path(self) -> None:
         state = WorkflowState(
             spec="ROL rotate left",
@@ -108,7 +174,7 @@ endmodule
         )
         prompt = _build_integration_prompt(state)
         human = prompt["human"].lower()
-        self.assertIn("natural result", human)
+        self.assertIn("selected from rtl evidence", human)
         self.assertIn("existing register-file write logic", human)
 
     def test_integration_rejects_lint_failure(self) -> None:

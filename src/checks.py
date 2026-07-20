@@ -12,6 +12,7 @@ from typing import Any
 
 from src.config import LACEConfig, get_env
 from src.formal.riscv_formal_runner import RiscvFormalRunner
+from src.formal.sandbox import prepare_riscv_formal_sandbox
 from src.state_types import WorkflowState, ensure_state
 
 
@@ -19,26 +20,33 @@ def verilator_syntax_check(
     content_or_path: str,
     extra_args: list[str] | None = None,
     include_dir: str | None = None,
+    include_dirs: list[str] | None = None,
+    source_files: list[str] | None = None,
+    top_module: str | None = None,
     verilator_std: str | None = None,
     verilator_waive_flags: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Check SystemVerilog syntax using Verilator."""
     resolved_include = include_dir or get_env("SV_FILES_DIR", ".")
 
-    try:
-        is_path = Path(content_or_path).exists()
-    except OSError:
-        is_path = False
-
-    if is_path:
-        files = [content_or_path]
+    if source_files:
+        files = source_files
         tmp_file = None
     else:
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".sv")
-        tmp_file.write(content_or_path.encode("utf-8"))
-        tmp_file.flush()
-        tmp_file.close()
-        files = [tmp_file.name]
+        try:
+            is_path = Path(content_or_path).exists()
+        except OSError:
+            is_path = False
+
+        if is_path:
+            files = [content_or_path]
+            tmp_file = None
+        else:
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".sv")
+            tmp_file.write(content_or_path.encode("utf-8"))
+            tmp_file.flush()
+            tmp_file.close()
+            files = [tmp_file.name]
 
     std_flag = verilator_std or "+1364-2005ext+.v"
     waive_flags = verilator_waive_flags or ["--Wno-MULTITOP"]
@@ -49,6 +57,12 @@ def verilator_syntax_check(
         f"-I{resolved_include}",
         std_flag,
     ]
+    for directory in include_dirs or []:
+        flag = f"-I{directory}"
+        if flag not in cmd:
+            cmd.append(flag)
+    if top_module:
+        cmd.extend(["--top-module", top_module])
     cmd.extend(waive_flags)
     if extra_args:
         cmd.extend(extra_args)
@@ -65,6 +79,70 @@ def verilator_syntax_check(
     success = proc.returncode == 0
     output = (proc.stdout or "") + (proc.stderr or "")
     return success, output
+
+
+def _project_verilator_inputs(state: WorkflowState) -> tuple[list[str], list[str], str] | None:
+    """Return a practical RTL source closure for registered multi-file CPUs."""
+    if state.cpu_name == "picorv32" or not state.workspace_dir or not state.cpu_top_file:
+        return None
+
+    workspace = Path(state.workspace_dir)
+    roots: list[Path]
+    if state.cpu_name == "e203_hbirdv2":
+        roots = [workspace / "rtl" / "e203"]
+    elif state.cpu_name == "cv32e40x":
+        roots = [workspace / "rtl"]
+    elif state.cpu_name == "ibex":
+        roots = [workspace / "rtl"]
+    else:
+        roots = [workspace]
+
+    paths: list[Path] = []
+    for root in roots:
+        if root.exists():
+            paths.extend(root.rglob("*.v"))
+            paths.extend(root.rglob("*.sv"))
+    # Generated companion modules such as lace_arithmetic.v live at the run
+    # workspace root rather than under the CPU's rtl/ directory.
+    for companion in (workspace / "lace_arithmetic.v", workspace / "lace_arithmetic.sv"):
+        if companion.exists():
+            paths.append(companion)
+    if state.cpu_name == "cv32e40x":
+        clock_gate = workspace / "bhv" / "cv32e40x_sim_clock_gate.sv"
+        if clock_gate.exists():
+            paths.append(clock_gate)
+    elif state.cpu_name == "ibex":
+        prim_root = workspace / "vendor" / "lowrisc_ip" / "ip"
+        ibex_prim_sources = (
+            prim_root / "prim" / "rtl" / "prim_secded_pkg.sv",
+            prim_root / "prim" / "rtl" / "prim_cipher_pkg.sv",
+            prim_root / "prim" / "rtl" / "prim_count_pkg.sv",
+            prim_root / "prim" / "rtl" / "prim_mubi_pkg.sv",
+            prim_root / "prim" / "rtl" / "prim_util_pkg.sv",
+            prim_root / "prim_generic" / "rtl" / "prim_ram_1p_pkg.sv",
+        )
+        paths.extend(path for path in ibex_prim_sources if path.exists())
+
+    top_path = workspace / state.cpu_top_file
+    if top_path.exists() and top_path not in paths:
+        paths.append(top_path)
+    if not paths:
+        return None
+
+    # SystemVerilog packages must be parsed before modules that import them.
+    unique_paths = sorted(
+        set(path.resolve() for path in paths),
+        key=lambda path: (0 if path.name.endswith("_pkg.sv") else 1, str(path)),
+    )
+    include_dirs = sorted({str(path.parent) for path in unique_paths})
+    if state.cpu_name == "ibex":
+        extra_includes = (
+            workspace / "vendor" / "lowrisc_ip" / "ip" / "prim" / "rtl",
+            workspace / "vendor" / "lowrisc_ip" / "dv" / "sv" / "dv_utils",
+        )
+        include_dirs.extend(str(path.resolve()) for path in extra_includes if path.exists())
+    top_module = Path(state.cpu_top_file).stem
+    return [str(path) for path in unique_paths], include_dirs, top_module
 
 
 def _extract_ports(code: str) -> set[str]:
@@ -109,6 +187,11 @@ def check_semantic_ports(state: WorkflowState) -> WorkflowState:
 def check_interface_syntax(state: WorkflowState | dict[str, Any]) -> WorkflowState:
     """Check if interface code passes Verilator syntax check."""
     state = ensure_state(state)
+    # Discovery failures occur before any patch is applied.  They are not
+    # Verilator failures and retrying the syntax gate with empty code would
+    # erase the source-evidence diagnostic.
+    if state.needs_review and state.last_error.startswith("RTL discovery"):
+        return state
     if not state.interface_code:
         retry = state.interface_retry_count + 1
         needs_review = retry > LACEConfig.MAX_TASK_RETRIES
@@ -123,12 +206,25 @@ def check_interface_syntax(state: WorkflowState | dict[str, Any]) -> WorkflowSta
         )
 
     include_dir = state.workspace_dir or state.sv_include_dir or None
-    ok, out = verilator_syntax_check(
-        state.interface_code,
-        include_dir=include_dir,
-        verilator_std=state.verilator_std or None,
-        verilator_waive_flags=state.verilator_waive_flags or None,
-    )
+    project_inputs = _project_verilator_inputs(state)
+    if project_inputs:
+        source_files, include_dirs, top_module = project_inputs
+        ok, out = verilator_syntax_check(
+            state.interface_code,
+            include_dir=include_dir,
+            include_dirs=include_dirs,
+            source_files=source_files,
+            top_module=top_module,
+            verilator_std=state.verilator_std or None,
+            verilator_waive_flags=state.verilator_waive_flags or None,
+        )
+    else:
+        ok, out = verilator_syntax_check(
+            state.interface_code,
+            include_dir=include_dir,
+            verilator_std=state.verilator_std or None,
+            verilator_waive_flags=state.verilator_waive_flags or None,
+        )
     notes = list(state.notes)
     if not ok:
         notes.append("Interface syntax check failed")
@@ -201,17 +297,20 @@ def check_interface_syntax(state: WorkflowState | dict[str, Any]) -> WorkflowSta
 def check_arithmetic_syntax(state: WorkflowState | dict[str, Any]) -> WorkflowState:
     """Check if arithmetic code passes Verilator syntax check.
 
-    On failure this escalates directly to needs_review rather than looping
-    back to arithmetic_writer. The arithmetic and interface branches run in
-    parallel (fork at ``dispatch``, join at ``semantic_port_check``); a retry
-    edge on the arithmetic branch would be re-driven by interface-branch
-    retries, runaway the retry counter, and let the join gate clear
-    needs_review — a silent failure. Retries are left to the stage-level
-    retry gates that bookend serial stages.
+    A failed attempt is retried within the dedicated Verilator budget. The
+    serial graph must never integrate arithmetic RTL that failed this gate.
     """
     state = ensure_state(state)
     if not state.arithmetic_code:
-        return state.model_copy(update={"arithmetic_syntax_ok": False})
+        retry = state.arithmetic_retry_count + 1
+        return state.model_copy(
+            update={
+                "arithmetic_syntax_ok": False,
+                "arithmetic_retry_count": retry,
+                "needs_review": retry > LACEConfig.MAX_VERILATOR_RETRIES,
+                "last_error": "Arithmetic writer returned empty code",
+            }
+        )
 
     include_dir = state.workspace_dir or state.sv_include_dir or None
     ok, out = verilator_syntax_check(
@@ -230,15 +329,25 @@ def check_arithmetic_syntax(state: WorkflowState | dict[str, Any]) -> WorkflowSt
         error_detail = "Arithmetic syntax check failed"
         if out:
             error_detail += f"\n\nVerilator output:\n{out[:2000]}"
+        retry = state.arithmetic_retry_count + 1
         return state.model_copy(
             update={
                 "arithmetic_syntax_ok": False,
+                "arithmetic_retry_count": retry,
                 "notes": notes,
-                "needs_review": True,
+                "needs_review": retry > LACEConfig.MAX_VERILATOR_RETRIES,
                 "last_error": error_detail,
             }
         )
-    return state.model_copy(update={"arithmetic_syntax_ok": ok, "notes": notes})
+    return state.model_copy(
+        update={
+            "arithmetic_syntax_ok": True,
+            "arithmetic_retry_count": 0,
+            "needs_review": False,
+            "last_error": "",
+            "notes": notes,
+        }
+    )
 
 
 def _extract_expected_signals(task: str) -> set[str]:
@@ -347,16 +456,26 @@ def _prepare_riscv_formal_runner(state: WorkflowState) -> tuple[RiscvFormalRunne
         if (ws_path / fname).exists():
             extra_verilog_files.append(fname)
 
-    return RiscvFormalRunner(cpu_name=state.cpu_name), extra_verilog_files
+    sandbox = prepare_riscv_formal_sandbox(
+        run_id=state.run_id,
+        cpu_name=state.cpu_name,
+        workspace_dir=state.workspace_dir,
+    )
+    return (
+        RiscvFormalRunner(
+            cpu_name=state.cpu_name,
+            riscv_formal_dir=str(sandbox),
+        ),
+        extra_verilog_files,
+    )
 
 
 def _skipped_formal_state(state: WorkflowState, reason: str) -> WorkflowState:
     """Build a state that records formal verification was skipped.
 
-    A skip is NOT a pass: function_ok is left False so downstream nodes cannot
-    mistake it for success, but needs_review stays False so the pipeline can
-    still proceed to instruction-model generation. The final checker is
-    responsible for escalating formal_skipped into needs_review.
+    A skip is NOT a pass and cannot be repaired by later generation nodes.
+    Escalate it immediately so the graph stops without spending another model
+    call or pretending that functional verification ran.
     """
     notes = list(state.notes)
     notes.append(f"riscv-formal: skipped ({reason})")
@@ -365,6 +484,8 @@ def _skipped_formal_state(state: WorkflowState, reason: str) -> WorkflowState:
             "function_ok": False,
             "advance_op": False,
             "formal_skipped": True,
+            "formal_terminal": True,
+            "needs_review": True,
             "last_error": f"Formal verification skipped: {reason}",
             "notes": notes,
         }
@@ -377,7 +498,10 @@ def _run_riscv_formal_baseline(state: WorkflowState) -> WorkflowState:
     Used by the original_function_checker to verify that interface modifications
     have not broken existing RV32I behavior.
     """
-    prepared = _prepare_riscv_formal_runner(state)
+    try:
+        prepared = _prepare_riscv_formal_runner(state)
+    except Exception as exc:
+        return _skipped_formal_state(state, f"sandbox setup failed: {exc}")
     if prepared is None:
         return _skipped_formal_state(state, "no workspace or untrusted RTL")
 
@@ -395,8 +519,17 @@ def _run_riscv_formal_baseline(state: WorkflowState) -> WorkflowState:
         f"{len(baseline_result['results'])} passed ({baseline_result['total_time']:.1f}s)"
     )
 
+    baseline_executed_zero_checks = baseline_result["passed"] and not baseline_result.get("results")
+    if baseline_executed_zero_checks:
+        baseline_result = dict(baseline_result)
+        baseline_result["passed"] = False
+        baseline_result["error"] = "riscv-formal baseline executed zero checks"
+
     if not baseline_result["passed"]:
         failed = [r for r in baseline_result["results"] if not r["passed"]]
+        deterministic_failure = any(
+            str(item.get("error", "")) == "Assertion failed" for item in failed
+        )
         error_msg = (
             f"riscv-formal baseline failed: {len(failed)}/{len(baseline_result['results'])} checks failed. "
             f"Errors: {'; '.join(r['error'] for r in failed if r['error'])[:200]}"
@@ -412,6 +545,7 @@ def _run_riscv_formal_baseline(state: WorkflowState) -> WorkflowState:
                 "last_error": error_msg,
                 "formal_check_error": error_msg,
                 "formal_check_passed": False,
+                "formal_terminal": baseline_executed_zero_checks or deterministic_failure,
                 "formal_check_results": {"baseline": baseline_result, "custom": {}},
                 "notes": notes,
             }
@@ -433,22 +567,37 @@ def _run_riscv_formal_check(state: WorkflowState) -> WorkflowState:
     Used by the final_function_checker after the custom instruction model has been
     generated and integrated.
     """
-    prepared = _prepare_riscv_formal_runner(state)
+    try:
+        prepared = _prepare_riscv_formal_runner(state)
+    except Exception as exc:
+        return _skipped_formal_state(state, f"sandbox setup failed: {exc}")
     if prepared is None:
         return _skipped_formal_state(state, "no workspace/cpu info or untrusted RTL")
 
     runner, extra_verilog_files = prepared
     custom_insns = list(state.custom_insn_names)
 
-    # Phase 1: Baseline checks (must pass)
-    baseline_result = runner.run_baseline_checks(
-        workspace_dir=state.workspace_dir,
-        cpu_top_file=state.cpu_top_file,
-        extra_verilog_files=extra_verilog_files,
-    )
+    # Phase 1: Baseline checks (must pass). original_function_checker runs on
+    # this same integrated workspace immediately before model generation, so a
+    # complete passing result can be reused. This avoids rerunning every base
+    # checker for each retry of a custom instruction check.
+    previous_baseline = state.formal_check_results.get("baseline", {})
+    if previous_baseline.get("passed") and previous_baseline.get("results"):
+        baseline_result = previous_baseline
+    else:
+        baseline_result = runner.run_baseline_checks(
+            workspace_dir=state.workspace_dir,
+            cpu_top_file=state.cpu_top_file,
+            extra_verilog_files=extra_verilog_files,
+        )
 
     notes = list(state.notes)
-    baseline_passed = baseline_result["passed"]
+    baseline_executed_zero_checks = baseline_result["passed"] and not baseline_result.get("results")
+    baseline_passed = baseline_result["passed"] and bool(baseline_result.get("results"))
+    if baseline_executed_zero_checks:
+        baseline_result = dict(baseline_result)
+        baseline_result["passed"] = False
+        baseline_result["error"] = "riscv-formal baseline executed zero checks"
     notes.append(
         f"riscv-formal baseline: {sum(1 for r in baseline_result['results'] if r['passed'])}/"
         f"{len(baseline_result['results'])} passed ({baseline_result['total_time']:.1f}s)"
@@ -471,6 +620,7 @@ def _run_riscv_formal_check(state: WorkflowState) -> WorkflowState:
                 "last_error": error_msg,
                 "formal_check_error": error_msg,
                 "formal_check_passed": False,
+                "formal_terminal": baseline_executed_zero_checks,
                 "formal_check_results": {"baseline": baseline_result, "custom": {}},
                 "notes": notes,
             }
@@ -479,6 +629,8 @@ def _run_riscv_formal_check(state: WorkflowState) -> WorkflowState:
     # Phase 2: Custom instruction checks
     custom_results: dict[str, Any] = {}
     custom_failures: list[str] = []
+    missing_custom_checks: list[str] = []
+    deterministic_custom_failure = False
 
     for insn in custom_insns:
         insn_result = runner.run_custom_instruction_checks(
@@ -493,13 +645,39 @@ def _run_riscv_formal_check(state: WorkflowState) -> WorkflowState:
             f"riscv-formal {insn}: {passed_count}/{len(insn_result['results'])} passed "
             f"({insn_result['total_time']:.1f}s)"
         )
-        if not insn_result["passed"]:
+        expected_check = f"insn_{insn}_ch0"
+        executed_checks = {
+            str(item.get("name", "")) for item in insn_result.get("results", [])
+        }
+        structural_errors = {
+            str(item.get("error", ""))
+            for item in insn_result.get("results", [])
+            if str(item.get("error", "")) in {".sby file not found"}
+        }
+        expected_check_missing = expected_check not in executed_checks or bool(structural_errors)
+        if any(
+            str(item.get("error", "")) == "Assertion failed"
+            for item in insn_result.get("results", [])
+        ):
+            deterministic_custom_failure = True
+        if not insn_result["passed"] or expected_check_missing:
             custom_failures.append(insn)
+            if expected_check_missing:
+                missing_custom_checks.append(expected_check)
+                notes.append(
+                    f"riscv-formal {insn}: expected check {expected_check} was not executed"
+                )
 
     if custom_failures:
-        error_msg = (
-            f"riscv-formal custom instruction checks failed: {', '.join(custom_failures)}"
-        )
+        if missing_custom_checks:
+            error_msg = (
+                "riscv-formal did not execute required custom checks: "
+                f"{', '.join(missing_custom_checks)}"
+            )
+        else:
+            error_msg = (
+                f"riscv-formal custom instruction checks failed: {', '.join(custom_failures)}"
+            )
         notes.append(error_msg)
         return state.model_copy(
             update={
@@ -509,6 +687,7 @@ def _run_riscv_formal_check(state: WorkflowState) -> WorkflowState:
                 "last_error": error_msg,
                 "formal_check_error": error_msg,
                 "formal_check_passed": False,
+                "formal_terminal": bool(missing_custom_checks) or deterministic_custom_failure,
                 "formal_check_results": {"baseline": baseline_result, "custom": custom_results},
                 "notes": notes,
             }
@@ -626,6 +805,26 @@ def final_function_check(state: WorkflowState | dict[str, Any]) -> WorkflowState
                 "needs_review": True,
                 "formal_skipped": True,
                 "last_error": "Arithmetic syntax check did not pass; final formal check skipped.",
+            }
+        )
+
+    # A successful baseline alone must never be reported as successful custom
+    # instruction verification. Model generation is a required stage, and at
+    # least one named custom instruction must reach riscv-formal.
+    if not state.custom_insn_names or not state.insn_model_code.strip():
+        notes = list(state.notes)
+        error = "Custom instruction model was not generated; custom formal checks cannot run."
+        notes.append(error)
+        return state.model_copy(
+            update={
+                "function_ok": False,
+                "advance_op": False,
+                "formal_check_passed": False,
+                "formal_check_error": error,
+                "formal_terminal": True,
+                "needs_review": True,
+                "last_error": error,
+                "notes": notes,
             }
         )
 

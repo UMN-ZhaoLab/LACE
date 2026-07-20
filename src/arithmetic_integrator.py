@@ -1,11 +1,8 @@
-"""Arithmetic integrator agent.
-
-Inserts the lace_arithmetic submodule instance into the modified picorv32.v
-so that riscv-formal sees a complete CPU with the custom instruction implemented.
-"""
+"""Arithmetic integrator agent for a source-discovered CPU workspace."""
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -103,8 +100,6 @@ def _fix_instance_ports(code: str, arithmetic_code: str) -> str:
     actual_ports = _extract_module_ports(arithmetic_code, "lace_arithmetic")
     if not actual_ports:
         return code
-    actual_port_names = {p["name"] for p in actual_ports}
-
     instance_match = re.search(
         r"lace_arithmetic\s+\w+\s*\((.*?)\);", code, re.DOTALL
     )
@@ -128,8 +123,6 @@ def _fix_instance_ports(code: str, arithmetic_code: str) -> str:
             return connections[port_name]
         # Map common port names to CPU wires
         mapping = {
-            "clk_i": "clk",
-            "rst_i": "resetn",
             "RdInstr_0_i": "RdInstr_0_o",
             "RdRS1_1_i": "RdRS1_1_o",
             "RdRS2_1_i": "RdRS2_1_o",
@@ -152,6 +145,16 @@ def _fix_instance_ports(code: str, arithmetic_code: str) -> str:
     new_connections: list[tuple[str, str]] = []
     for port in actual_ports:
         port_name = port["name"]
+        # These are pass-through observation outputs from the generated
+        # arithmetic skeleton.  The CPU-side signals with the same names are
+        # already driven by execution-stage registers and feed the matching
+        # ``*_i`` ports. Connecting the observation outputs back to those
+        # wires creates a combinational second driver.
+        if port["direction"] == "output" and port_name in {
+            "RdRS1_1_o",
+            "RdRS2_1_o",
+        }:
+            continue
         sig = _default_signal(port_name)
         if sig:
             new_connections.append((port_name, sig))
@@ -169,13 +172,63 @@ def _fix_instance_ports(code: str, arithmetic_code: str) -> str:
     return code[:instance_start] + new_instance + code[instance_end:]
 
 
+def _remove_submodule_output_drivers(code: str, arithmetic_code: str) -> str:
+    """Make arithmetic output connections single-driver CPU-side wires.
+
+    Interface generation can mistakenly declare a net connected to an output
+    port as ``reg`` and also assign it in CPU procedural blocks. Once the
+    arithmetic instance drives that net, those assignments are illegal mixed
+    drivers. Port direction is the source of truth: remove CPU procedural
+    assignments to connected arithmetic outputs and normalize their simple
+    declarations to ``wire``.
+    """
+    output_ports = {
+        port["name"]
+        for port in _extract_module_ports(arithmetic_code, "lace_arithmetic")
+        if port["direction"] == "output"
+    }
+    if not output_ports:
+        return code
+
+    instance_match = re.search(
+        r"lace_arithmetic\s+\w+\s*\((.*?)\);", code, re.DOTALL
+    )
+    if not instance_match:
+        return code
+    connections = dict(
+        re.findall(r"\.(\w+)\s*\(\s*(\w+)\s*\)", instance_match.group(1))
+    )
+
+    updated = code
+    for port_name in sorted(output_ports):
+        signal_name = connections.get(port_name)
+        if not signal_name:
+            continue
+        escaped = re.escape(signal_name)
+        # Generated interface nets use one declaration per line. Preserve the
+        # width and indentation while changing their storage kind.
+        updated = re.sub(
+            rf"(?m)^(\s*)reg(\s+(?:\[[^\]]+\]\s*)?){escaped}(\s*;)",
+            rf"\1wire\2{signal_name}\3",
+            updated,
+        )
+        # A submodule output is the sole driver. Remove only direct procedural
+        # assignment statements; instance connections and reads are retained.
+        updated = re.sub(
+            rf"(?m)^[ \t]*{escaped}[ \t]*(?:<=|=)[^;\n]*;[ \t]*(?://[^\n]*)?\n?",
+            "",
+            updated,
+        )
+    return updated
+
+
 def _build_integration_prompt(state: WorkflowState) -> dict[str, str]:
     """Build the prompt for the arithmetic integrator agent."""
     interface_code = state.interface_code or ""
     arithmetic_code = state.arithmetic_code or ""
 
     human_parts = [
-        "## Modified CPU Top Module (picorv32.v)\n\n",
+        "## Modified CPU Source\n\n",
         "```verilog\n",
         interface_code,
         "\n```\n\n",
@@ -192,6 +245,13 @@ def _build_integration_prompt(state: WorkflowState) -> dict[str, str]:
             "\n\n",
         ])
 
+    if state.integration_evidence:
+        human_parts.extend([
+            "## Verified CPU Integration Evidence\n\n```json\n",
+            json.dumps(state.integration_evidence, indent=2),
+            "\n```\n\n",
+        ])
+
     human_parts.append(
         "## Required Connections\n\n"
         "Instantiate `lace_arithmetic` inside the CPU module using the internal "
@@ -200,12 +260,14 @@ def _build_integration_prompt(state: WorkflowState) -> dict[str, str]:
         "- .RdInstr_0_i(RdInstr_0_o)\n"
         "- .RdRS1_1_i(RdRS1_1_o)\n"
         "- .RdRS2_1_i(RdRS2_1_o)\n"
-        "- .WrRD_2_o(WrRD_2_i)         # interface_writer will route WrRD_2_i to the CPU's natural result signal\n"
+        "- .WrRD_2_o(WrRD_2_i)\n"
         "- .WrRD_validReq_2_o(WrRD_validReq_2_i)\n"
-        "- .clk_i(clk), .rst_i(resetn)\n\n"
+        "- Connect `clk_i` and `rst_i` only to source-proven CPU clock/reset signals.\n\n"
         "The CPU-side wire `WrRD_2_i` must be routed by interface_writer to the existing "
-        "writeback/result path (e.g., `reg_out` or `alu_out` in picorv32). Do NOT create "
+        "writeback/result path selected from RTL evidence. Do NOT create "
         "a separate write-enable or bypass; reuse the existing register-file write logic.\n\n"
+        "Signals connected to `lace_arithmetic` OUTPUT ports are CPU-side wires driven only "
+        "by that instance. Do NOT assign those nets in CPU `always` blocks.\n\n"
         "Please instantiate `lace_arithmetic` inside the CPU module, "
         "connecting ports to the matching internal wires. Return a complete rewritten "
         "CPU file or a SEARCH/REPLACE diff that only adds the instance."
@@ -217,39 +279,42 @@ def _build_integration_prompt(state: WorkflowState) -> dict[str, str]:
     }
 
 
-def arithmetic_integrator(state: WorkflowState | dict[str, Any]) -> WorkflowState:
-    """Integrate the arithmetic submodule into the modified CPU top module.
-
-    This agent takes the modified picorv32.v (with ISAX ports added) and the
-    generated lace_arithmetic.v module, and inserts an instance of
-    lace_arithmetic inside picorv32 with proper port connections.
-    """
+def arithmetic_integrator(
+    state: WorkflowState | dict[str, Any],
+    raw_output: str | None = None,
+) -> WorkflowState:
+    """Integrate the arithmetic submodule into the source-discovered CPU."""
     state = ensure_state(state)
 
     if not state.interface_code or not state.arithmetic_code:
         # Nothing to integrate
         return state
 
-    prompt = _build_integration_prompt(state)
-    model = get_chat_model()
-    messages = [
-        SystemMessage(content=prompt["system"]),
-        HumanMessage(content=prompt["human"]),
-    ]
+    if raw_output is None:
+        prompt = _build_integration_prompt(state)
+        model = get_chat_model()
+        messages = [
+            SystemMessage(content=prompt["system"]),
+            HumanMessage(content=prompt["human"]),
+        ]
 
-    try:
-        response = invoke_with_backoff(model, messages, LACEConfig.MAX_STAGE_RETRIES + 1)
-        content = response.content if hasattr(response, "content") else str(response)
-    except Exception as exc:
-        notes = list(state.notes)
-        notes.append(f"Arithmetic integrator LLM call failed: {exc}")
-        return state.model_copy(
-            update={
-                "needs_review": True,
-                "last_error": f"Arithmetic integrator failed: {exc}",
-                "notes": notes,
-            }
-        )
+        try:
+            response = invoke_with_backoff(model, messages, LACEConfig.MAX_STAGE_RETRIES + 1)
+            content = response.content if hasattr(response, "content") else str(response)
+        except Exception as exc:
+            notes = list(state.notes)
+            notes.append(f"Arithmetic integrator LLM call failed: {exc}")
+            return state.model_copy(
+                update={
+                    "needs_review": True,
+                    "last_error": f"Arithmetic integrator failed: {exc}",
+                    "notes": notes,
+                }
+            )
+    else:
+        # Interactive Mode supplies output generated by the client LLM, so no
+        # server-side model/API call is made for this step.
+        content = raw_output
 
     try:
         integrated_code = _parse_model_response(content, state.interface_code)
@@ -298,6 +363,9 @@ def arithmetic_integrator(state: WorkflowState | dict[str, Any]) -> WorkflowStat
     integrated_code = _fix_instance_ports(
         integrated_code, state.arithmetic_code or ""
     )
+    integrated_code = _remove_submodule_output_drivers(
+        integrated_code, state.arithmetic_code or ""
+    )
 
     # Write integrated code back to workspace
     target_dir = _get_target_dir(state)
@@ -306,7 +374,7 @@ def arithmetic_integrator(state: WorkflowState | dict[str, Any]) -> WorkflowStat
         out_path.write_text(integrated_code, encoding="utf-8")
 
     notes = list(state.notes)
-    notes.append("Arithmetic submodule integrated into picorv32.v")
+    notes.append("Arithmetic submodule integrated into the selected CPU source")
 
     # Re-run Verilator lint on the FINAL integrated file. The interface
     # syntax check ran before integration; the integrator (and _ensure_instance_wires
@@ -314,14 +382,27 @@ def arithmetic_integrator(state: WorkflowState | dict[str, Any]) -> WorkflowStat
     # splices that break the file. Without this gate a syntactically broken
     # CPU would reach the (slow) riscv-formal stage and the syntax_ok flag
     # would be a false positive.
-    from src.checks import verilator_syntax_check
+    from src.checks import _project_verilator_inputs, verilator_syntax_check
 
-    ok, out = verilator_syntax_check(
-        integrated_code,
-        include_dir=target_dir or None,
-        verilator_std=state.verilator_std or None,
-        verilator_waive_flags=state.verilator_waive_flags or None,
-    )
+    project_inputs = _project_verilator_inputs(state)
+    if project_inputs:
+        source_files, include_dirs, top_module = project_inputs
+        ok, out = verilator_syntax_check(
+            integrated_code,
+            include_dir=target_dir or None,
+            include_dirs=include_dirs,
+            source_files=source_files,
+            top_module=top_module,
+            verilator_std=state.verilator_std or None,
+            verilator_waive_flags=state.verilator_waive_flags or None,
+        )
+    else:
+        ok, out = verilator_syntax_check(
+            integrated_code,
+            include_dir=target_dir or None,
+            verilator_std=state.verilator_std or None,
+            verilator_waive_flags=state.verilator_waive_flags or None,
+        )
     if not ok:
         error_detail = "Integrated CPU failed Verilator lint after arithmetic integration"
         if out:

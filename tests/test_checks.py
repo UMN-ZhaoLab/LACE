@@ -1,14 +1,16 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src.checks import (
     check_arithmetic_syntax,
     check_interface_syntax,
     check_semantic_ports,
     function_check,
+    final_function_check,
 )
+from src.config import LACEConfig
 from src.interactive_engine import merge_interface_result
 from src.state_types import WorkflowState
 
@@ -86,6 +88,7 @@ class TestChecks(unittest.TestCase):
         state = self._make_state(arithmetic_code="")
         result = check_arithmetic_syntax(state)
         self.assertFalse(result.arithmetic_syntax_ok)
+        self.assertEqual(result.arithmetic_retry_count, 1)
         mock_verilator.assert_not_called()
 
     @patch("src.checks.verilator_syntax_check")
@@ -94,7 +97,24 @@ class TestChecks(unittest.TestCase):
         state = self._make_state(arithmetic_code="bad")
         result = check_arithmetic_syntax(state)
         self.assertFalse(result.arithmetic_syntax_ok)
+        self.assertFalse(result.needs_review)
+        self.assertEqual(result.arithmetic_retry_count, 1)
         self.assertIn("Arithmetic syntax check failed", result.notes)
+
+    @patch("src.checks.verilator_syntax_check")
+    def test_check_arithmetic_syntax_exhausts_retry_budget(self, mock_verilator) -> None:
+        mock_verilator.return_value = (False, "error")
+        state = self._make_state(
+            arithmetic_code="bad",
+            arithmetic_retry_count=LACEConfig.MAX_VERILATOR_RETRIES,
+        )
+        result = check_arithmetic_syntax(state)
+        self.assertFalse(result.arithmetic_syntax_ok)
+        self.assertTrue(result.needs_review)
+        self.assertEqual(
+            result.arithmetic_retry_count,
+            LACEConfig.MAX_VERILATOR_RETRIES + 1,
+        )
 
     @patch("src.checks.verilator_syntax_check")
     def test_check_arithmetic_syntax_success(self, mock_verilator) -> None:
@@ -187,6 +207,131 @@ class TestChecks(unittest.TestCase):
         self.assertFalse(result.advance_op)
         self.assertTrue(result.formal_skipped)
         self.assertIn("skipped", " ".join(result.notes).lower())
+
+    def test_final_function_check_rejects_missing_custom_model(self) -> None:
+        state = self._make_state(
+            interface_syntax_ok=True,
+            arithmetic_code="module lace_arithmetic; endmodule",
+            arithmetic_syntax_ok=True,
+            custom_insn_names=[],
+            insn_model_code="",
+        )
+
+        result = final_function_check(state)
+
+        self.assertFalse(result.function_ok)
+        self.assertFalse(result.formal_check_passed)
+        self.assertTrue(result.formal_terminal)
+        self.assertTrue(result.needs_review)
+        self.assertIn("model was not generated", result.last_error)
+
+    @patch("src.checks._prepare_riscv_formal_runner")
+    def test_final_function_check_rejects_zero_custom_checks(self, mock_prepare) -> None:
+        runner = MagicMock()
+        runner.run_baseline_checks.return_value = {
+            "passed": True,
+            "results": [{"name": "cover", "passed": True}],
+            "total_time": 1.0,
+            "error": "",
+        }
+        runner.run_custom_instruction_checks.return_value = {
+            "passed": True,
+            "results": [],
+            "total_time": 0.0,
+            "error": "",
+        }
+        mock_prepare.return_value = (runner, [])
+        state = self._make_state(
+            interface_syntax_ok=True,
+            arithmetic_code="module lace_arithmetic; endmodule",
+            arithmetic_syntax_ok=True,
+            custom_insn_names=["rol"],
+            insn_model_code="module rvfi_insn_rol (); endmodule",
+        )
+
+        result = final_function_check(state)
+
+        self.assertFalse(result.function_ok)
+        self.assertFalse(result.formal_check_passed)
+        self.assertTrue(result.formal_terminal)
+        self.assertTrue(result.needs_review)
+        self.assertIn("insn_rol_ch0", result.last_error)
+
+    @patch("src.checks._prepare_riscv_formal_runner")
+    def test_final_function_check_treats_missing_sby_as_terminal(self, mock_prepare) -> None:
+        runner = MagicMock()
+        runner.run_custom_instruction_checks.return_value = {
+            "passed": False,
+            "results": [{
+                "name": "insn_aes32esi_ch0",
+                "passed": False,
+                "elapsed_seconds": 0.0,
+                "error": ".sby file not found",
+                "trace_path": "",
+            }],
+            "total_time": 0.0,
+            "error": "",
+        }
+        mock_prepare.return_value = (runner, [])
+        baseline = {
+            "passed": True,
+            "results": [{"name": "cover", "passed": True}],
+            "total_time": 1.0,
+            "error": "",
+        }
+        state = self._make_state(
+            interface_syntax_ok=True,
+            arithmetic_code="module lace_arithmetic; endmodule",
+            arithmetic_syntax_ok=True,
+            custom_insn_names=["aes32esi"],
+            insn_model_code="module rvfi_insn_aes32esi (); endmodule",
+            formal_check_results={"baseline": baseline, "custom": {}},
+        )
+
+        result = final_function_check(state)
+
+        self.assertFalse(result.function_ok)
+        self.assertTrue(result.formal_terminal)
+        self.assertTrue(result.needs_review)
+        self.assertIn("insn_aes32esi_ch0", result.last_error)
+        runner.run_baseline_checks.assert_not_called()
+
+    @patch("src.checks._prepare_riscv_formal_runner")
+    def test_final_function_check_treats_assertion_fail_as_terminal(self, mock_prepare) -> None:
+        runner = MagicMock()
+        runner.run_custom_instruction_checks.return_value = {
+            "passed": False,
+            "results": [{
+                "name": "insn_rol_ch0",
+                "passed": False,
+                "elapsed_seconds": 2.0,
+                "error": "Assertion failed",
+                "trace_path": "trace.vcd",
+            }],
+            "total_time": 2.0,
+            "error": "",
+        }
+        mock_prepare.return_value = (runner, [])
+        baseline = {
+            "passed": True,
+            "results": [{"name": "cover", "passed": True}],
+            "total_time": 1.0,
+            "error": "",
+        }
+        state = self._make_state(
+            interface_syntax_ok=True,
+            arithmetic_code="module lace_arithmetic; endmodule",
+            arithmetic_syntax_ok=True,
+            custom_insn_names=["rol"],
+            insn_model_code="module rvfi_insn_rol (); endmodule",
+            formal_check_results={"baseline": baseline, "custom": {}},
+        )
+
+        result = final_function_check(state)
+
+        self.assertFalse(result.function_ok)
+        self.assertTrue(result.formal_terminal)
+        self.assertTrue(result.needs_review)
 
     def test_check_semantic_ports_warns_on_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

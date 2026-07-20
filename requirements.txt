@@ -1,0 +1,22 @@
+# Core orchestration & LLM
+langchain==1.2.7
+langchain-core==1.2.7
+langchain-openai==1.1.0
+langgraph==1.0.7
+langgraph-api==0.7.9
+
+# Environment & schema
+python-dotenv==1.2.1
+pydantic==2.12.5
+PyYAML==6.0.3
+
+# Diff processing
+unidiff==0.7.5
+
+# MCP server SDK
+mcp>=1.20.0
+
+# RAG & Graph DB
+langchain-neo4j==0.6.0
+neo4j==5.28.2
+sentence-transformers>=3.0.0

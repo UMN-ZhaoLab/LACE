@@ -1,0 +1,41 @@
+cpus:
+  picorv32:
+    cpu_dir: cpu_prototype/picorv32
+    top_file: picorv32.v
+    sv_include_dir: cpu_prototype/picorv32
+    verilator_std: "+1364-2005ext+.v"
+    verilator_waive_flags:
+      - "--Wno-MULTITOP"
+      - "--Wno-TIMESCALEMOD"
+  e203_hbirdv2:
+    cpu_dir: cpu_prototype/e203_hbirdv2
+    top_file: rtl/e203/core/e203_cpu_top.v
+    sv_include_dir: cpu_prototype/e203_hbirdv2
+    verilator_std: "+1364-2005ext+.v"
+    verilator_waive_flags:
+      - "--Wno-MULTITOP"
+      - "--Wno-TIMESCALEMOD"
+      - "--Wno-WIDTHEXPAND"
+      - "--Wno-WIDTHTRUNC"
+      - "--Wno-LATCH"
+      - "--Wno-UNOPTFLAT"
+      - "--no-timing"
+  cv32e40x:
+    cpu_dir: cpu_prototype/cv32e40x
+    top_file: rtl/cv32e40x_core.sv
+    sv_include_dir: cpu_prototype/cv32e40x
+    verilator_std: "+1800-2017ext+.sv"
+    verilator_waive_flags:
+      - "--Wno-MULTITOP"
+      - "--Wno-TIMESCALEMOD"
+      - "--Wno-IMPLICIT"
+      - "--Wno-WIDTHEXPAND"
+      - "--Wno-WIDTHTRUNC"
+      - "--Wno-COMBDLY"
+      - "--Wno-BLKANDNBLK"
+      - "--Wno-UNOPTFLAT"
+  ibex:
+    cpu_dir: cpu_prototype/ibex
+    top_file: rtl/ibex_top.sv
+    sv_include_dir: cpu_prototype/ibex
+    verilator_std: "+1800-2017ext+.sv"

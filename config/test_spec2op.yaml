@@ -1,0 +1,18 @@
+# Batch test: spec2op step for all prompt specs in src.prompts.spec2op
+# Stops at spec_and_cpu node so we only test decomposition + CPU analysis.
+cpu: picorv32
+mock: false
+to: spec_and_cpu
+runs:
+  - run_id: rol
+    spec: bitwise_rotation
+  - run_id: aes32esi
+    spec: sbox_aes
+  - run_id: vadd
+    spec: vector_add
+  - run_id: ijumpl
+    spec: indirect_jump
+  - run_id: ldmul
+    spec: load_multiple
+  - run_id: x_dotp
+    spec: spec2op_example

@@ -83,6 +83,20 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertIsInstance(state, WorkflowState)
         self.assertTrue(state.interface_syntax_ok)
         self.assertTrue(state.arithmetic_syntax_ok)
+        self.assertEqual(
+            state.hdl_task_op_index_map,
+            list(range(len(state.ops))),
+            "every micro-operation must receive an HDL plan",
+        )
+        self.assertTrue(state.candidate_modules)
+        self.assertEqual(
+            sum(1 for entry in _log if entry["step_name"] == "arithmetic_integrator"),
+            1,
+        )
+        self.assertEqual(
+            sum(1 for entry in _log if entry["step_name"] == "original_function_checker"),
+            1,
+        )
         mock_verilator.assert_called()
 
     @patch("src.checks.verilator_syntax_check")
@@ -105,7 +119,7 @@ class TestPipelineE2E(unittest.TestCase):
         }
         mock_runner_cls.return_value.run_custom_instruction_checks.return_value = {
             "passed": True,
-            "results": [{"passed": True}],
+            "results": [{"name": "insn_mock_ch0", "passed": True}],
             "total_time": 1.0,
             "error": "",
         }
@@ -144,19 +158,15 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertFalse(state.function_ok)
 
     @patch("src.checks._prepare_riscv_formal_runner")
-    def test_arithmetic_failure_halts_without_retry_loop(
+    def test_arithmetic_failure_retries_then_halts_before_formal(
         self,
         mock_prepare: MagicMock,
     ) -> None:
-        """An arithmetic syntax failure must halt with needs_review=True.
+        """Arithmetic syntax failures consume their budget, then halt before formal.
 
-        Regression guard: the arithmetic branch runs in parallel with the
-        interface branch (fork at dispatch, join at semantic_port_check). A
-        retry back-edge on the arithmetic branch would be re-driven by
-        interface-branch retries, runaway the retry counter, and let the
-        formal gate clear needs_review — a silent failure. So an arithmetic
-        failure must escalate immediately and arithmetic_writer must run
-        exactly once.
+        Regression guard: broken arithmetic must never reach integration or
+        be masked by a later gate. The writer gets bounded correction attempts,
+        then the serial syntax gate escalates the failure.
         """
         from pathlib import Path
         from langchain_core.messages import AIMessage
@@ -188,6 +198,13 @@ class TestPipelineE2E(unittest.TestCase):
         model.with_structured_output.side_effect = _wso
         def _direct_invoke(messages):
             text = " ".join(getattr(m, "content", "") if not isinstance(m, str) else m for m in messages)
+            if "RTL integration analyst" in text:
+                import json
+                item = {
+                    "file": "picorv32.v", "lines": [1, 1],
+                    "signals": ["module"], "excerpt": "module picorv32",
+                }
+                return AIMessage(content=json.dumps({key: item for key in ("decode", "writeback", "timing")}))
             if "Required Extension Interface Wires" in text:
                 return AIMessage(content="No changes are needed.")
             # Broken arithmetic: missing closing paren — real Verilator rejects it.
@@ -211,10 +228,18 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertTrue(state.needs_review)
         self.assertFalse(state.arithmetic_syntax_ok)
         self.assertFalse(state.function_ok)
-        self.assertTrue(state.formal_skipped)
-        # No retry loop: arithmetic_writer runs exactly once.
-        aw_runs = sum(1 for e in log if e["step_name"] == "arithmetic_writer")
-        self.assertEqual(aw_runs, 1, f"arithmetic_writer ran {aw_runs} times (expected 1)")
+        self.assertFalse(state.formal_skipped)
+        syntax_runs = sum(1 for e in log if e["step_name"] == "check_arithmetic_syntax")
+        expected_runs = LACEConfig.MAX_VERILATOR_RETRIES + 1
+        self.assertEqual(
+            syntax_runs,
+            expected_runs,
+            f"arithmetic syntax gate ran {syntax_runs} times (expected {expected_runs})",
+        )
+        self.assertFalse(
+            any(e["step_name"] == "original_function_checker" for e in log),
+            "formal baseline must not run after arithmetic lint exhaustion",
+        )
 
     @patch("src.checks.verilator_syntax_check")
     @patch("src.checks._prepare_riscv_formal_runner")
